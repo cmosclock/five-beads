@@ -1,0 +1,2090 @@
+<!doctype html>
+<!-- Built by dev/build-webrtc.mjs from five-beads.html and dev/webrtc-room.js. Edit those, then rebuild. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#24222f">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='-1 -1 2 2'%3E%3Ccircle r='1' fill='%2324222f'/%3E%3Ccircle r='.6' fill='%23f3c6ae'/%3E%3C/svg%3E">
+<script>
+// Stand-in for the artifact viewer's `room` capability, for hosting Five Beads outside claude.ai.
+// Peers find each other through public Nostr relays (Trystero) and then talk over direct WebRTC
+// data channels. The room id lives in the URL hash (#room=…), so a friend joins with the link.
+// The game page is unchanged: it still asks `window.claude.use('room')` and folds presence copies,
+// and draws its invite control from `window.fiveBeadsHost`.
+// dev/build-webrtc.mjs inlines this file into five-beads-webrtc.html.
+(() => {
+  'use strict';
+  const TRYSTERO = 'https://cdn.jsdelivr.net/npm/@trystero-p2p/nostr@0.25.4/+esm';
+  const APP_ID = 'five-beads-gomoku-v1';
+  // Players on networks that refuse direct connections (some mobile carriers, strict office NATs)
+  // need a TURN relay. Add yours here, e.g. { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' }.
+  const TURN = [];
+
+  // ---- room id and invite link ------------------------------------------------------------
+  // New rooms get 12 random digits (~40 bits; the id also seeds the handshake password), shown as 4821·7730·1956.
+  const digits = (n) => {
+    let s = '';
+    while (s.length < n) for (const b of crypto.getRandomValues(new Uint8Array(n))) if (b < 250 && s.length < n) s += b % 10;
+    return s;
+  };
+  const roomInHash = () => {
+    const m = /(?:^#|&)room=([a-z0-9-]{4,64})(?:&|$)/i.exec(location.hash);
+    return m ? m[1].toLowerCase() : null;
+  };
+  let roomId = roomInHash();
+  if (!roomId) {
+    roomId = digits(12);
+    history.replaceState(history.state, '', location.href.split('#')[0] + '#room=' + roomId);
+  }
+  const inviteLink = () => location.href.split('#')[0] + '#room=' + roomId;
+  /** Numerals only on screen: a 12-digit id as is, any other id (older letter links) as a 12-digit FNV-1a fingerprint. */
+  const display = (() => {
+    let d = roomId;
+    if (!/^\d{12}$/.test(d)) {
+      let x = 0xcbf29ce484222325n;
+      for (const ch of new TextEncoder().encode(roomId)) x = ((x ^ BigInt(ch)) * 0x100000001b3n) & 0xffffffffffffffffn;
+      d = (x % 1000000000000n).toString().padStart(12, '0');
+    }
+    return d.slice(0, 4) + '·' + d.slice(4, 8) + '·' + d.slice(8);
+  })();
+  // the page resumes this tab's last table after a reload; that table belongs to the room it was in
+  try {
+    if (sessionStorage.getItem('fivebeads.room') !== roomId) {
+      sessionStorage.removeItem('fivebeads.table');
+      sessionStorage.setItem('fivebeads.room', roomId);
+    }
+  } catch {}
+  addEventListener('hashchange', () => { if (roomInHash() !== roomId) location.reload(); });
+  // a page restored from the back/forward cache has already left its room
+  addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });
+
+  // one id per browser, standing in for the viewer's person id
+  const ALPHA = 'abcdefghjkmnpqrstuvwxyz23456789';
+  const rand = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => ALPHA[b % ALPHA.length]).join('');
+  let by = null;
+  try { by = localStorage.getItem('fivebeads.who'); } catch {}
+  if (!/^w_[a-z0-9]{6,24}$/.test(by || '')) {
+    by = 'w_' + rand(10);
+    try { localStorage.setItem('fivebeads.who', by); } catch {}
+  }
+
+  // ---- room ---------------------------------------------------------------------------------
+  const plain = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+  const freezeCopy = (v) => Object.freeze(JSON.parse(JSON.stringify(plain(v))));
+
+  function makeRoom({ joinRoom, selfId, getRelaySockets }) {
+    const room = joinRoom({
+      appId: APP_ID,
+      password: 'five-beads/' + roomId,   // keeps SDPs unreadable to relays that don't know the link
+      turnConfig: TURN,
+      // every page with this appId picks the same relays; 8 rather than 5 so a few dead ones don't matter
+      relayConfig: { redundancy: 8, warnOnRelayFailure: false },
+    }, roomId);
+    const wire = room.makeAction('pres');
+
+    let mine = {};
+    const others = new Map();             // peer id -> { by, presence, updatedAt }, once they've spoken
+    let snap = Object.freeze([]);
+    const peerFns = new Set(), connFns = new Set();
+    let change = null;
+
+    const entry = (peer, o) => Object.freeze({ peer, by: o.by, isMe: false, sameTab: false, kind: 'viewer', guest: false, presence: o.presence, updatedAt: o.updatedAt });
+    function rebuild(kind, peer) {
+      const me = Object.freeze({ peer: selfId, by, isMe: true, sameTab: true, kind: 'viewer', guest: false, presence: freezeCopy(mine), updatedAt: Date.now() });
+      snap = Object.freeze([me, ...[...others].map(([id, o]) => entry(id, o))]);
+      if (!change) {
+        change = { joined: [], left: [], updated: [] };
+        setTimeout(() => {
+          const c = { peers: snap, ...change };
+          change = null;
+          peerFns.forEach((fn) => fn(c));
+        }, 0);
+      }
+      if (kind) change[kind].push(peer);
+    }
+
+    const sendMine = (target) => wire.send({ by, presence: mine }, target ? { target } : undefined);
+    room.onPeerJoin = (id) => { sendMine(id).catch(() => {}); };
+    room.onPeerLeave = (id) => {
+      const o = others.get(id);
+      if (!o) return;
+      others.delete(id);
+      rebuild('left', entry(id, o));
+    };
+    wire.onMessage = (data, { peerId }) => {
+      if (!data || typeof data !== 'object' || typeof peerId !== 'string') return;
+      const known = others.has(peerId);
+      const o = {
+        by: typeof data.by === 'string' && data.by.length <= 200 ? data.by : null,
+        presence: freezeCopy(data.presence),
+        updatedAt: Date.now(),
+      };
+      others.set(peerId, o);
+      rebuild(known ? 'updated' : 'joined', entry(peerId, o));
+      // in case our hello raced their join, make sure they have us too
+      if (!known) sendMine(peerId).catch(() => {});
+    };
+
+    // "online" while at least one relay is reachable or anyone is connected directly
+    let connected = false;
+    const checkConn = () => {
+      let on = others.size > 0;
+      if (!on) for (const s of Object.values(getRelaySockets() || {})) if (s && s.readyState === 1) { on = true; break; }
+      if (on === connected) return;
+      connected = on;
+      connFns.forEach((fn) => fn(on));
+    };
+    setInterval(checkConn, 1000);
+    addEventListener('pagehide', () => { room.leave().catch(() => {}); });
+    rebuild();
+
+    return Object.freeze({
+      id: roomId,
+      presence(patch) {
+        const next = { ...mine };
+        for (const k in plain(patch)) { if (patch[k] === null) delete next[k]; else next[k] = patch[k]; }
+        mine = next;
+        rebuild();
+        return sendMine();
+      },
+      peers: () => snap,
+      onPeers(fn) {
+        peerFns.add(fn);
+        setTimeout(() => fn({ peers: snap, joined: snap, left: [], updated: [] }), 0);
+        return () => peerFns.delete(fn);
+      },
+      connected: () => connected,
+      onConnection(fn) {
+        connFns.add(fn);
+        setTimeout(() => fn(connected), 0);
+        return () => connFns.delete(fn);
+      },
+    });
+  }
+
+  let opening = null;
+  const openRoom = () => (opening ??= import(TRYSTERO).then(makeRoom));
+  // There is no profile service here, so `user` is unavailable and other players show as a hollow figure.
+  window.claude = Object.freeze({ use: async (name) => (name === 'room' ? openRoom() : null) });
+  // What the page needs to draw its invite control and its reload-and-retry control.
+  window.fiveBeadsHost = Object.freeze({ display, invite: inviteLink, retry: () => location.reload() });
+})();
+</script>
+<title>Five Beads</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@300..800&display=swap">
+<style>
+/* Layout: the board sits in the hearth of a faint coil of beads (Ollune's dusk); a frosted sheet beside it holds the seats, the tables and their glyphs.
+   Ollune's language throughout: no words on screen, only glyphs, numerals joined by middle dots, people's names, and "ollu"/"teelu" in the bubble. Dark-only, like Ollune. */
+:root {
+  color-scheme: dark;
+
+  /* dusk surfaces: twilight plum-slate, never black */
+  --dusk-deep: #1e1c27;
+  --dusk-0: #24222f;
+  --dusk-1: #2c2939;
+  --dusk-2: #36324a;
+  --dusk-3: #403b56;
+  --dusk-glow: #322e44;
+  --line: #4b4662;
+
+  /* ink */
+  --ink: #e6e1f0;
+  --ink-dim: #aba4c2;
+  --ink-faint: #736c8c; /* decorative only, never text */
+
+  /* accents, one job each */
+  --peach: #f3c6ae;  /* first side: a filled core */
+  --lilac: #c6b6f2;  /* second side: a slotted halo */
+  --rose: #f2b3c8;   /* now and here: whose turn, focus, last bead, your table */
+  --butter: #f0e1a4; /* the win */
+  --mint: #a6dec9;   /* online */
+  --sky: #a7c7f0;    /* coil decoration only */
+
+  --focus: color-mix(in oklab, var(--rose) 75%, transparent);
+  --selection: color-mix(in oklab, var(--rose) 35%, transparent);
+
+  /* type */
+  --font: 'Nunito', 'Hiragino Maru Gothic ProN', 'Yu Gothic UI', 'Meiryo', 'Apple SD Gothic Neo', system-ui, sans-serif;
+  --wt-body: 380;
+  --wt-num: 520;
+  --wt-word: 560;
+  --track-meta: 0.06em;
+
+  /* shape */
+  --r-md: 12px;
+  --r-xl: 20px;
+  --r-pill: 999px;
+  --shadow-1: 0 4px 16px rgb(14 12 22 / 0.35);
+  --shadow-2: 0 12px 40px rgb(14 12 22 / 0.5);
+
+  /* motion */
+  --ease-settle: cubic-bezier(0.22, 0.8, 0.24, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+  --t-hover: 140ms;
+  --t-whisper: 160ms;
+  --t-bloom: 500ms;
+  --t-thread: 600ms;
+  --t-breath: 6s;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--dusk-0);
+  color: var(--ink);
+  font: var(--wt-body) 15px/1.45 var(--font);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--selection); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+button { font: inherit; color: inherit; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.icon { display: block; flex: none; width: 18px; height: 18px; }
+.glyph { display: block; flex: none; }
+
+.world { position: relative; height: 100%; }
+#sky { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
+
+.app {
+  position: relative;
+  height: 100%;
+  max-width: 1280px;
+  margin-inline: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(280px, 30vw, 340px);
+  gap: clamp(20px, 3vw, 44px);
+  padding-inline: clamp(16px, 3vw, 44px);
+  padding-block: clamp(16px, 3vh, 32px);
+}
+
+/* --- board ------------------------------------------------------------------------ */
+/* sized without container queries: a query container is its own stacking context, which would trap the legend under its scrim */
+.stage { position: relative; min-width: 0; min-height: 0; display: grid; place-items: center; }
+.board-wrap { position: relative; width: min(100%, calc(100svh - 2 * clamp(16px, 3vh, 32px))); aspect-ratio: 1; max-width: 100%; }
+.plate {
+  position: absolute;
+  inset: 1.875%;
+  border-radius: 3.6%;
+  background: color-mix(in oklab, var(--dusk-1) 90%, transparent);
+  border: 1px solid color-mix(in oklab, var(--line) 75%, transparent);
+  box-shadow: var(--shadow-2), inset 0 1px 0 color-mix(in oklab, var(--ink) 5%, transparent);
+  transition: border-color var(--t-hover) var(--ease-soft);
+}
+.plate.yours { border-color: color-mix(in oklab, var(--rose) 40%, transparent); }
+.plate.glow { animation: plate-glow 600ms var(--ease-soft); }
+@keyframes plate-glow {
+  from { box-shadow: var(--shadow-2), 0 0 0 0 color-mix(in oklab, var(--rose) 30%, transparent); }
+  to { box-shadow: var(--shadow-2), 0 0 0 8px transparent; }
+}
+.board-wrap:has(#board:focus-visible) .plate { border-color: var(--focus); }
+#board {
+  position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+  touch-action: manipulation; user-select: none; -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent; outline: none;
+}
+#board.can { cursor: pointer; }
+.grid line { stroke: var(--line); stroke-width: 1px; }
+.grid .edge { stroke: color-mix(in oklab, var(--line) 80%, var(--ink-faint)); }
+.hoshi { fill: var(--ink-faint); }
+.tengen { fill: none; stroke: var(--rose); stroke-opacity: 0.55; stroke-width: 1px; }
+.breath { opacity: 0.08; animation: breath calc(var(--t-breath) / 2) cubic-bezier(0.37, 0, 0.63, 1) infinite alternate; }
+@keyframes breath { to { opacity: 0.16; } }
+
+.core { fill: var(--peach); }
+.halo-ground { fill: var(--dusk-1); }
+.halo { fill: none; stroke: var(--lilac); stroke-width: 0.12; stroke-dasharray: 0.2034 0.044; }
+.pip { fill: var(--lilac); }
+.stone { transform-box: fill-box; transform-origin: center; }
+.stone.new { animation: bloom var(--t-bloom) var(--ease-settle) both; }
+@keyframes bloom { from { transform: scale(0.55); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+#stones > g { transition: opacity var(--t-hover) var(--ease-soft); }
+#board.pv-clear #stones > g { opacity: 0.45; }
+#stones > g.pv-last { opacity: 0.35; }
+.cleared { opacity: 0.35; }
+
+.seat-ring { fill: none; stroke: var(--rose); stroke-width: 1.5px; stroke-opacity: 0.85; }
+.undo-ring { fill: none; stroke: var(--ink-dim); stroke-width: 1.5px; stroke-dasharray: 3 2.5; }
+.ghost { opacity: 0.3; transition: opacity var(--t-hover) var(--ease-soft); }
+.ghost.armed { opacity: 0.62; }
+.hint-bead { animation: hint 2.4s var(--ease-soft) infinite alternate; }
+@keyframes hint { from { opacity: 0.3; } to { opacity: 0.55; } }
+.hint-ring { fill: none; stroke: var(--rose); stroke-width: 1.5px; transform-box: fill-box; transform-origin: center; animation: beat 2.4s var(--ease-soft) infinite; }
+.their-cursor { fill: none; stroke-width: 1.5px; stroke-dasharray: 2 3; opacity: 0.85; }
+.their-cursor.p { stroke: var(--peach); }
+.their-cursor.l { stroke: var(--lilac); }
+.kb-cursor { fill: none; stroke: var(--rose); stroke-width: 1.5px; stroke-dasharray: 3 2; }
+.thread { stroke: var(--butter); stroke-width: 0.08; stroke-linecap: round; opacity: 0.9; transition: stroke-dashoffset var(--t-thread) var(--ease-soft); }
+.win-glow { animation: winglow 2.4s ease-in-out infinite alternate; }
+@keyframes winglow { from { opacity: 0.65; } to { opacity: 1; } }
+
+/* Ollune's slit-beat: a rose ring that breathes around whatever wants a first touch */
+@keyframes beat {
+  0%, 100% { opacity: 0.2; transform: scale(0.92); }
+  50% { opacity: 0.8; transform: scale(1.06); }
+}
+.beat, .beat3, .beat8 { position: relative; }
+.beat::before, .beat3::before, .beat8::before {
+  content: ''; position: absolute; inset: -3px; border-radius: inherit;
+  border: 1.5px solid var(--rose); pointer-events: none; opacity: 0;
+  animation: beat 2.4s var(--ease-soft) infinite;
+  animation-delay: var(--beat-at, 0s); /* negative: resume a beat that started before this node existed */
+}
+.beat3::before { animation-iteration-count: 3; }
+.beat8::before { animation-iteration-count: 8; }
+/* one 600 ms rose pulse, on ::before because the seat bead's ::after is its turn ring */
+@keyframes pulse { from { opacity: 0.8; transform: scale(1); } to { opacity: 0; transform: scale(1.35); } }
+.pulse { position: relative; }
+.pulse::before {
+  content: ''; position: absolute; inset: -2px; border-radius: 50%;
+  border: 1.5px solid var(--rose); pointer-events: none; opacity: 0;
+  animation: pulse 600ms var(--ease-soft);
+}
+
+/* the companion bubble */
+.bubble {
+  position: absolute; left: 50%; top: 4%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 6px;
+  min-height: 30px; padding: 5px 12px;
+  border-radius: var(--r-pill);
+  background: color-mix(in oklab, var(--dusk-2) 96%, transparent);
+  box-shadow: var(--shadow-1);
+  color: var(--ink); font-size: 14px; font-weight: var(--wt-word);
+  pointer-events: none;
+  animation: bubble 2.86s linear both;
+}
+.bubble .icon, .bubble .glyph { width: 16px; height: 16px; }
+.bubble .spark { color: var(--butter); }
+@keyframes bubble { 0% { opacity: 0; } 5.6% { opacity: 1; } 89.5% { opacity: 1; } 100% { opacity: 0; } }
+
+/* --- sheet ------------------------------------------------------------------------ */
+.sheet {
+  align-self: center;
+  max-height: 100%;
+  overflow: auto;
+  display: flex; flex-direction: column; gap: 16px;
+  padding: 18px 18px 14px;
+  border-radius: var(--r-xl);
+  background: color-mix(in oklab, var(--dusk-0) 74%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid color-mix(in oklab, var(--line) 55%, transparent);
+  box-shadow: var(--shadow-2);
+}
+.head { display: flex; align-items: center; gap: 10px; min-height: 32px; }
+#mark { width: 34px; height: 20px; flex: none; }
+.conn { margin-left: auto; width: 16px; height: 16px; display: grid; place-items: center; color: var(--ink-dim); }
+.conn .icon { width: 14px; height: 14px; }
+.conn[data-state='on'] { color: var(--mint); }
+.conn[data-state='on'] .icon { width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 0 3px color-mix(in oklab, var(--mint) 20%, transparent); }
+.conn[data-state='wait'] .icon { animation: spin 2.4s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.round {
+  position: relative;
+  width: 28px; height: 28px; padding: 0; flex: none;
+  display: grid; place-items: center;
+  border: 0; border-radius: 50%;
+  background: transparent; color: var(--ink-dim);
+  cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease-soft), color var(--t-hover) var(--ease-soft);
+}
+.round .icon { width: 16px; height: 16px; }
+.round:hover, .round:focus-visible { background: var(--dusk-2); color: var(--ink); }
+#legend-btn[aria-expanded='true'] { background: var(--dusk-3); color: var(--ink); }
+
+.mode { display: flex; align-items: center; gap: 6px; min-height: 20px; color: var(--ink-dim); font-size: 12px; font-weight: var(--wt-num); letter-spacing: var(--track-meta); }
+.mode .icon { width: 16px; height: 16px; }
+.mode .watch { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+.mode .watch .icon { width: 14px; height: 14px; }
+
+/* seats: a seat is a place, peach always first */
+.seats { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; }
+.seat {
+  --side: var(--peach);
+  position: relative;
+  display: grid; grid-template-columns: 26px minmax(0, 1fr) auto auto; align-items: center; gap: 10px;
+  width: 100%; min-height: 44px; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: var(--r-md);
+  background: transparent; color: var(--ink); text-align: left;
+  transition: background-color var(--t-hover) var(--ease-soft);
+}
+.seat.l { --side: var(--lilac); }
+.bead { position: relative; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; }
+.bead .glyph { width: 26px; height: 26px; }
+.bead.ghost .glyph { opacity: 0.3; }
+.bead::after { content: ''; position: absolute; inset: -1.5px; border-radius: 50%; border: 1.5px solid transparent; pointer-events: none; transition: border-color var(--t-hover) var(--ease-soft); }
+.seat.turn { background: var(--dusk-2); }
+.seat.turn .bead::after { border-color: var(--rose); }
+.seat.paused .bead::after { border-style: dashed; }
+.seat.won { background: color-mix(in oklab, var(--butter) 8%, transparent); }
+.seat.won .bead::after { border-color: var(--butter); animation: fade-in var(--t-bloom) var(--ease-settle); }
+.seat.won-ghost .bead::after { border-color: color-mix(in oklab, var(--butter) 50%, transparent); }
+@keyframes fade-in { from { opacity: 0; } }
+.who { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.who .icon { width: 16px; height: 16px; }
+.icon.me { color: var(--ink); }
+.icon.person { color: var(--ink-dim); }
+.who .name { font-size: 15px; font-weight: var(--wt-word); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seat.gone .who { opacity: 0.5; }
+.marks { display: flex; align-items: center; gap: 4px; color: var(--ink-dim); }
+.marks .icon { width: 16px; height: 16px; }
+.marks .butter, .tmeta .butter, .tp .butter { color: var(--butter); }
+.marks .ink { color: var(--ink); }
+.marks .half { opacity: 0.5; }
+.marks .faint { opacity: 0.35; }
+.count { min-width: 1.4em; text-align: right; font-size: 14px; font-weight: var(--wt-num); color: var(--ink-dim); }
+button.seat { cursor: pointer; border: 1px dashed color-mix(in oklab, var(--side) 45%, transparent); }
+button.seat:hover, button.seat:focus-visible { background: var(--dusk-2); }
+.chip-add {
+  position: relative;
+  display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%;
+  border: 1.5px dashed color-mix(in oklab, var(--side) 70%, transparent);
+  color: var(--side);
+}
+.chip-add .icon { width: 14px; height: 14px; }
+.ghost-me { opacity: 0; transition: opacity var(--t-hover) var(--ease-soft); }
+button.seat:hover .ghost-me, button.seat:focus-visible .ghost-me { opacity: 0.4; }
+
+.dots circle { animation: dot 1.2s var(--ease-soft) infinite; }
+.dots circle:nth-child(2) { animation-delay: 0.3s; }
+.dots circle:nth-child(3) { animation-delay: 0.6s; }
+.dots.still circle { animation: none; opacity: 0.6; }
+@keyframes dot { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+/* glyph buttons */
+.actions { display: flex; align-items: center; gap: 8px; margin-top: 12px; min-height: 36px; }
+.actions .end { margin-left: auto; display: flex; gap: 8px; padding-left: 16px; }
+.gbtn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-width: 36px; height: 36px; padding: 0 8px;
+  border: 1px solid var(--line); border-radius: var(--r-pill);
+  background: var(--dusk-2); color: var(--ink-dim);
+  cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease-soft), color var(--t-hover) var(--ease-soft), opacity var(--t-hover) var(--ease-soft);
+}
+.gbtn:hover:not(:disabled) { background: var(--dusk-3); color: var(--ink); }
+.gbtn.primary { background: color-mix(in oklab, var(--rose) 20%, var(--dusk-1)); border-color: color-mix(in oklab, var(--rose) 55%, transparent); color: var(--ink); }
+.gbtn.primary:hover:not(:disabled) { background: color-mix(in oklab, var(--rose) 30%, var(--dusk-1)); }
+.gbtn[aria-pressed='true'] { background: var(--dusk-3); color: var(--ink-dim); border-color: var(--line); }
+.gbtn:disabled { opacity: 0.35; cursor: default; }
+.gbtn.armed { min-width: 72px; background: color-mix(in oklab, var(--rose) 12%, var(--dusk-1)); animation: widen var(--t-whisper) var(--ease-settle); }
+.gbtn.armed .icon:first-child { width: 16px; height: 16px; }
+.gbtn.armed .chk { color: var(--ink); }
+@keyframes widen { from { min-width: 36px; } }
+.drain { position: absolute; inset: -1px; width: calc(100% + 2px); height: calc(100% + 2px); pointer-events: none; overflow: visible; }
+.drain rect { fill: none; stroke: color-mix(in oklab, var(--rose) 60%, transparent); stroke-width: 1.5px; stroke-dasharray: 100; animation: drain 4s linear forwards; }
+@keyframes drain { from { stroke-dashoffset: 0; } to { stroke-dashoffset: 100; } }
+.actions.arming .gbtn:not(.armed) { opacity: 0.45; }
+@media (pointer: coarse) {
+  .gbtn { min-width: 44px; height: 44px; }
+  .gbtn.armed { min-width: 80px; }
+}
+
+/* lobby */
+.hair { margin: 0; border: 0; height: 1px; background: color-mix(in oklab, var(--line) 60%, transparent); }
+.lobby-head { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+.stack { display: flex; align-items: center; }
+.stack .icon { width: 14px; height: 14px; }
+.stack .icon + .icon { margin-left: -3px; }
+.stack .icon.arrive { animation: arrive 320ms var(--ease-settle); }
+.stack .n { margin-left: 4px; font-size: 12px; font-weight: var(--wt-num); color: var(--ink-dim); }
+@keyframes arrive { from { opacity: 0; transform: scale(0.6); } }
+.invite { margin-left: auto; display: flex; align-items: center; gap: 4px; color: var(--ink-dim); font-size: 12px; font-weight: var(--wt-num); letter-spacing: var(--track-meta); white-space: nowrap; }
+.invite .round { border-radius: 50%; }
+.invite .round .icon { width: 18px; height: 18px; }
+.invite-field { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 10px; border-radius: 10px; background: var(--dusk-2); color: var(--ink-dim); }
+.invite-field .icon { width: 14px; height: 14px; }
+.invite-field input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; color: var(--ink-dim); font: 13px var(--font); }
+
+.tlist { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 6px; }
+.trow {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) 32px; align-items: center; gap: 12px;
+  padding: 9px 10px 9px 12px;
+  border-radius: var(--r-md);
+  background: color-mix(in oklab, var(--dusk-1) 70%, transparent);
+}
+.trow.here { box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--rose) 45%, transparent); }
+.tcode { display: grid; gap: 2px; }
+.tcode b { font-size: 14px; font-weight: var(--wt-num); letter-spacing: 0.02em; }
+.tmeta { display: flex; align-items: center; gap: 4px; min-height: 14px; color: var(--ink-dim); font-size: 12px; font-weight: var(--wt-num); }
+.tmeta .icon { width: 12px; height: 12px; }
+.tmeta .grp { display: flex; align-items: center; gap: 4px; }
+.tmeta .grp + .grp { margin-left: 4px; }
+.tplayers { display: grid; gap: 3px; min-width: 0; }
+.tp { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 6px; min-width: 0; font-size: 13px; }
+.tp .glyph { width: 14px; height: 14px; }
+.tp.open .glyph { opacity: 0.3; }
+.tp .id { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.tp .id .icon { width: 14px; height: 14px; }
+.tp .id .icon.spark { width: 10px; height: 10px; }
+.tp .id span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tp .cnt { font-size: 12px; font-weight: var(--wt-num); color: var(--ink-dim); }
+.chip {
+  --side: var(--peach);
+  display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--line); background: transparent; color: var(--ink-dim); cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease-soft), color var(--t-hover) var(--ease-soft);
+}
+.chip.l { --side: var(--lilac); }
+.chip .icon { width: 16px; height: 16px; }
+.chip:hover { color: var(--ink); background: var(--dusk-2); }
+.chip.add { border: 1.5px dashed color-mix(in oklab, var(--side) 70%, transparent); color: var(--side); }
+.chip.add:hover { background: color-mix(in oklab, var(--side) 14%, transparent); }
+.here-me { display: grid; place-items: center; color: var(--ink); }
+.here-me .icon { width: 16px; height: 16px; }
+.wide {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  width: 100%; height: 40px; padding: 0;
+  border: 1px dashed color-mix(in oklab, var(--line) 85%, transparent); border-radius: var(--r-md);
+  background: transparent; color: var(--ink-dim);
+}
+button.wide { cursor: pointer; transition: background-color var(--t-hover) var(--ease-soft); }
+button.wide:hover:not(:disabled) { background: var(--dusk-2); }
+button.wide:disabled { opacity: 0.35; cursor: default; }
+.wide.primary { border-color: color-mix(in oklab, var(--rose) 55%, transparent); color: var(--rose); }
+.wide .icon { width: 16px; height: 16px; }
+.wide .icon.small { width: 14px; height: 14px; }
+.wide.quiet { border-color: transparent; gap: 12px; }
+.wide.quiet .icon.ink { color: var(--ink); }
+
+.rule-strip {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; min-height: 28px; padding: 6px 8px;
+  border: 0; border-radius: var(--r-md);
+  background: transparent; opacity: 0.8; cursor: pointer;
+  transition: opacity var(--t-hover) var(--ease-soft), background-color var(--t-hover) var(--ease-soft);
+}
+.rule-strip:hover, .rule-strip:focus-visible { opacity: 1; background: var(--dusk-2); }
+.rule-wrap { padding-top: 12px; border-top: 1px solid color-mix(in oklab, var(--line) 50%, transparent); }
+
+/* legend: glyph samples only */
+.legend-scrim { position: fixed; inset: 0; z-index: 40; background: color-mix(in oklab, var(--dusk-deep) 55%, transparent); }
+.legend {
+  position: absolute; left: 50%; top: 50%; z-index: 41;
+  transform: translate(-50%, -50%);
+  width: min(600px, 100%); max-height: 100%; overflow: auto;
+  display: flex; flex-wrap: wrap; gap: 12px 22px; justify-content: center;
+  padding: 20px 24px;
+  border-radius: var(--r-xl);
+  background: color-mix(in oklab, var(--dusk-2) 96%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-2);
+  outline: none;
+  animation: fade-in var(--t-whisper) var(--ease-soft);
+}
+.lg-panel { display: grid; gap: 10px; align-content: start; min-width: 150px; }
+.lg-row { display: flex; align-items: center; gap: 7px; color: var(--ink-dim); font-size: 12px; font-weight: var(--wt-num); }
+.lg-row .icon { width: 16px; height: 16px; }
+.lg-row .glyph { width: 16px; height: 16px; }
+.lg-row .ink { color: var(--ink); }
+.lg-row .butter { color: var(--butter); }
+.lg-row .mint { color: var(--mint); }
+.lg-row .half { opacity: 0.5; }
+.lg-row .ghosted { opacity: 0.35; }
+.lead { width: 14px; height: 1px; background: var(--ink-faint); flex: none; }
+.lg-ring { position: relative; display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; }
+.lg-ring::after { content: ''; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--rose); }
+.lg-ring.butter::after { border-color: var(--butter); }
+.lg-ring.dashed::after { border-style: dashed; }
+.lg-pill { display: flex; align-items: center; gap: 4px; height: 22px; padding: 0 7px; border-radius: var(--r-pill); border: 1px solid color-mix(in oklab, var(--rose) 60%, transparent); background: color-mix(in oklab, var(--rose) 12%, var(--dusk-1)); }
+.lg-pill .icon { width: 13px; height: 13px; }
+.lg-chip { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; border: 1.5px dashed color-mix(in oklab, var(--lilac) 70%, transparent); color: var(--lilac); }
+.lg-chip .icon { width: 11px; height: 11px; }
+.lg-dash { width: 44px; height: 14px; border: 1px dashed var(--line); border-radius: 6px; }
+.lg-num { display: flex; align-items: center; gap: 3px; }
+.lg-stack { display: grid; gap: 4px; }
+
+@media (max-width: 820px) {
+  html, body, .world { height: auto; }
+  .app { height: auto; grid-template-columns: minmax(0, 1fr); }
+  .board-wrap { width: min(100%, 78svh); }
+  .sheet { align-self: stretch; max-height: none; overflow: visible; }
+  .legend { position: fixed; max-height: 86svh; width: calc(100% - 32px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+  .dots circle { opacity: 0.7; }
+  .hint-bead { opacity: 0.45; }
+  /* still, not gone: the bubble stays up until it is removed, the confirm outline and the beats rest as static rings */
+  .bubble, .drain rect { animation: none !important; }
+  .beat::before, .beat3::before, .beat8::before { animation: none !important; opacity: 0.7; }
+}
+</style>
+</head>
+<body>
+<div class="world" id="world">
+  <canvas id="sky" aria-hidden="true"></canvas>
+  <main class="app">
+    <div class="stage" id="stage">
+      <div class="board-wrap" id="wrap">
+        <div class="plate" id="plate"></div>
+        <svg id="board" viewBox="0 0 16 16" tabindex="0" role="application" aria-label="Gomoku board, 15 by 15. Arrow keys move, Enter places a bead." aria-describedby="status"></svg>
+      </div>
+      <div class="legend" id="legend" role="dialog" aria-label="How to play" tabindex="-1" hidden></div>
+    </div>
+
+    <aside class="sheet" aria-label="Five Beads">
+      <h1 class="sr-only">Five Beads</h1>
+      <header class="head">
+        <svg viewBox="-0.5 -0.5 1.7 1" aria-hidden="true" id="mark"></svg>
+        <span class="conn" id="conn" data-state="wait" role="img" aria-label="connecting"></span>
+        <button type="button" class="round" id="legend-btn" aria-label="How to play" aria-expanded="false" aria-controls="legend"></button>
+      </header>
+
+      <section id="game" aria-label="Game on this device">
+        <div class="mode" id="mode"></div>
+        <ul class="seats" id="seats"></ul>
+        <div class="actions" id="actions"></div>
+      </section>
+
+      <hr class="hair">
+
+      <section aria-label="Tables">
+        <div class="lobby-head" id="lobby-head"></div>
+        <div id="lobby"></div>
+      </section>
+
+      <div class="rule-wrap">
+        <button type="button" class="rule-strip" id="rule-strip" aria-label="How to play: five or more beads in a row wins, peach moves first"></button>
+      </div>
+    </aside>
+  </main>
+  <div class="legend-scrim" id="legend-scrim" hidden></div>
+  <p class="sr-only" id="status" aria-live="polite"></p>
+  <p class="sr-only" id="say" aria-live="polite"></p>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+// ---- rules ---------------------------------------------------------------------------
+const N = 15, CELLS = N * N;
+const SEATS = ['p', 'l'];
+const COLOR = { p: 1, l: 2 };          // board cell values
+const SIDE = { p: 'Peach', l: 'Lilac' }; // screen-reader words only
+const OTHER = { p: 'l', l: 'p' };
+const COLS = 'ABCDEFGHJKLMNOP';         // board letters skip I, as on a go board
+
+const enc = (i) => i.toString(36).padStart(2, '0');
+const dec = (m) => { const a = []; for (let k = 0; k < m.length; k += 2) a.push(parseInt(m.slice(k, k + 2), 36)); return a; };
+const xy = (i) => [i % N, (i / N) | 0];
+const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+
+/** The run of five or more through `idx`, as cell indices in order, or null. */
+function runThrough(board, idx) {
+  const c = board[idx], [x0, y0] = xy(idx);
+  for (const [dx, dy] of DIRS) {
+    const line = [idx];
+    for (let s = 1; ; s++) {
+      const x = x0 + dx * s, y = y0 + dy * s;
+      if (x < 0 || y < 0 || x >= N || y >= N || board[y * N + x] !== c) break;
+      line.push(y * N + x);
+    }
+    for (let s = 1; ; s++) {
+      const x = x0 - dx * s, y = y0 - dy * s;
+      if (x < 0 || y < 0 || x >= N || y >= N || board[y * N + x] !== c) break;
+      line.unshift(y * N + x);
+    }
+    if (line.length >= 5) return line;
+  }
+  return null;
+}
+
+/** Replays a move list. null when it is not a legal game (repeat point, off board, play after a win). */
+function analyze(moves) {
+  const board = new Int8Array(CELLS);
+  let win = null;
+  for (let k = 0; k < moves.length; k++) {
+    const i = moves[k];
+    if (!(i >= 0 && i < CELLS) || board[i] || win) return null;
+    board[i] = k % 2 ? 2 : 1;
+    const line = runThrough(board, i);
+    if (line) win = { seat: k % 2 ? 'l' : 'p', line };
+  }
+  return { board, win, n: moves.length, full: moves.length === CELLS };
+}
+const EMPTY = analyze([]);
+
+function outcome(g, a) {
+  if (a.win) return { kind: 'five', winner: a.win.seat, line: a.win.line };
+  if (g && g.x) return { kind: 'resign', loser: g.x, winner: OTHER[g.x] };
+  if (a.full) return { kind: 'draw' };
+  return null;
+}
+
+// ---- shared table state ----------------------------------------------------------------
+// Everyone at a table keeps the whole game in their room presence: { t: table code, g: game, h: hover, rm: rematch }.
+// A game is { id, p: seat, l: seat, m: moves, x: resigned side }, a seat is { peer, by, at }.
+// Every page folds all copies with the same rules, so they converge without a host:
+// highest id, then the longest legal move list, and for each seat someone present over someone gone, then the earlier claim.
+
+function cleanSeat(s) {
+  if (!s || typeof s !== 'object' || typeof s.peer !== 'string' || !s.peer || s.peer.length > 80) return null;
+  return {
+    peer: s.peer,
+    by: typeof s.by === 'string' && s.by.length <= 200 ? s.by : null,
+    at: Number.isFinite(s.at) ? s.at : 0,
+  };
+}
+function cleanGame(g) {
+  if (!g || typeof g !== 'object') return null;
+  if (!Number.isInteger(g.id) || g.id < 1 || g.id > 1e6) return null;
+  if (typeof g.m !== 'string' || g.m.length > CELLS * 2 || !/^(?:[0-9a-z]{2})*$/.test(g.m)) return null;
+  const p = cleanSeat(g.p), l = cleanSeat(g.l);
+  return { id: g.id, p, l: l && p && l.peer === p.peer ? null : l, m: g.m, x: g.x === 'p' || g.x === 'l' ? g.x : null };
+}
+function betterSeat(a, b, present) {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.peer === b.peer) return a.at <= b.at ? a : b;
+  const pa = present.has(a.peer), pb = present.has(b.peer);
+  if (pa !== pb) return pa ? a : b;
+  if (a.at !== b.at) return a.at < b.at ? a : b;
+  return a.peer < b.peer ? a : b;
+}
+const tableOf = (p) => (p.presence && typeof p.presence.t === 'string' && /^[1-9]\d{3}$/.test(p.presence.t) ? p.presence.t : null);
+
+/** Folds every copy of table `code` into one game. */
+function canonFor(code) {
+  const parts = S.peers.filter((p) => tableOf(p) === code);
+  const present = new Set(parts.map((p) => p.peer));
+  if (S.mode === 'table' && S.code === code && S.me.peer) present.add(S.me.peer);
+  const gs = [];
+  for (const p of parts) { const g = cleanGame(p.presence.g); if (g) gs.push(g); }
+  if (S.mode === 'table' && S.code === code && S.g) gs.push(S.g);
+  if (!gs.length) return { g: null, present, parts };
+  let id = 0;
+  for (const g of gs) id = Math.max(id, g.id);
+  let m = null, p = null, l = null, x = null;
+  for (const g of gs) {
+    if (g.id !== id) continue;
+    if (analyze(dec(g.m)) && (m === null || g.m.length > m.length || (g.m.length === m.length && g.m < m))) m = g.m;
+    p = betterSeat(p, g.p, present);
+    l = betterSeat(l, g.l, present);
+    if (g.x && (!x || g.x < x)) x = g.x;
+  }
+  if (p && l && p.peer === l.peer) l = null;
+  return { g: { id, p, l, m: m ?? '', x }, present, parts };
+}
+
+/** Both players asked for a rematch of this game: start the next one with sides swapped. */
+function rematchOf(c) {
+  const g = c.g;
+  if (!g || !g.p || !g.l || !outcome(g, analyze(dec(g.m)) || EMPTY)) return g;
+  if (c.present.has(g.p.peer) && c.present.has(g.l.peer) && wantsRematch(g.p, g.id, c.parts) && wantsRematch(g.l, g.id, c.parts)) {
+    return { id: g.id + 1, p: g.l, l: g.p, m: '', x: null };
+  }
+  return g;
+}
+function wantsRematch(seat, id, parts) {
+  if (!seat) return false;
+  if (seat.peer === S.me.peer) return S.rm === id;
+  return (parts || S.parts).some((p) => p.peer === seat.peer && p.presence.rm === id);
+}
+
+// ---- state -------------------------------------------------------------------------------
+const S = {
+  mode: 'local',        // 'local' = two players on this device, 'table' = an online table
+  local: [], cleared: null,
+  code: null, g: null, hover: -1, armed: -1, rm: null,
+  wantSeat: null, joinedAt: 0,
+  confirm: null,        // { kind: 'resign' | 'leave', at } while a destructive press waits for its second press
+  preview: null,        // 'clear' | 'undo' while hovering New game / Undo
+  room: undefined,      // undefined while asking, null when online play is not available here
+  user: null, connected: false,
+  peers: [], me: { peer: null, by: null },
+  present: new Set(), parts: [],
+  cursor: 7 * N + 7, kbd: false,
+  invite: { copied: false, field: false, used: false },
+};
+const store = {
+  get(k, area) { try { return JSON.parse(window[area || 'localStorage'].getItem(k)); } catch { return null; } },
+  set(k, v, area) { try { const s = window[area || 'localStorage']; if (v == null) s.removeItem(k); else s.setItem(k, JSON.stringify(v)); } catch {} },
+};
+// Set by a host page that serves Five Beads outside claude.ai (the peer-to-peer build): { display, invite(), retry() }.
+const host = window.fiveBeadsHost || null;
+
+const seatHere = (s) => !!s && S.present.has(s.peer);
+const myColor = (g) => (!g || !S.me.peer ? null : g.p && g.p.peer === S.me.peer ? 'p' : g.l && g.l.peer === S.me.peer ? 'l' : null);
+const mySeat = () => ({ peer: S.me.peer, by: S.me.by, at: Date.now() });
+const fmtCode = (c) => c.slice(0, 2) + '·' + c.slice(2);
+const spoken = (c) => c.replace(/·/g, ' ');
+
+function view() {
+  const local = S.mode !== 'table';
+  const g = local ? null : S.g;
+  const moves = local ? S.local : g ? dec(g.m) : [];
+  const a = analyze(moves) || EMPTY;
+  const out = local || g ? outcome(g, a) : null;
+  const turn = moves.length % 2 ? 'l' : 'p';
+  const mine = local ? turn : myColor(g);
+  const both = local || (!!g && seatHere(g.p) && seatHere(g.l));
+  const canPlace = !out && !!mine && mine === turn && both && (local || !!g);
+  return { local, g, moves, a, out, turn, mine, both, canPlace };
+}
+
+// ---- names ---------------------------------------------------------------------------------
+const prof = new Map(), asked = new Set();
+let profVer = 0;
+function wantNames() {
+  if (!S.user) return;
+  const ids = new Set();
+  for (const p of S.peers) {
+    if (p.by) ids.add(p.by);
+    const g = p.presence && cleanGame(p.presence.g);
+    if (g) for (const sk of SEATS) if (g[sk] && g[sk].by) ids.add(g[sk].by);
+  }
+  const need = [...ids].filter((id) => !asked.has(id));
+  if (!need.length) return;
+  need.forEach((id) => asked.add(id));
+  S.user.profiles(need).then((res) => {
+    for (const id of need) prof.set(id, (res && res[id]) || null);
+    profVer++;
+    render();
+  }, () => {});
+}
+const nameOf = (by) => (by && prof.get(by) && prof.get(by).name) || '';
+/** Plain-language name for screen readers: "you", a name, or the side. */
+function label(seat, sk) {
+  if (seat && seat.peer === S.me.peer) return 'you';
+  return (seat && nameOf(seat.by)) || SIDE[sk];
+}
+
+// ---- presence --------------------------------------------------------------------------------
+let lastPub = '';
+function publish() {
+  if (!S.room) return;
+  const v = view();
+  const h = v.canPlace ? (S.armed >= 0 ? S.armed : S.hover) : -1;
+  const pres = S.mode === 'table'
+    ? { v: 1, t: S.code, g: S.g, h: h >= 0 && !v.a.board[h] ? h : null, rm: S.rm }
+    : { v: 1, t: null, g: null, h: null, rm: null };
+  const s = JSON.stringify(pres);
+  if (s === lastPub) return;
+  lastPub = s;
+  S.room.presence(pres).catch(() => { lastPub = ''; });
+}
+
+function sync() {
+  if (S.mode === 'table') {
+    const c = canonFor(S.code);
+    S.present = c.present;
+    S.parts = c.parts;
+    const g = c.g ? rematchOf(c) : null;
+    if (g && S.g && g.id !== S.g.id) { S.rm = null; S.confirm = null; S.armed = -1; }
+    if (g) S.g = g;
+    if (S.wantSeat && S.g) claim(S.wantSeat);
+    // nobody has this table: give up after 3 s once others are in the room; peer-to-peer rooms
+    // can take a while to connect after a reload, so they get up to 20 s while this page is alone
+    const waited = Date.now() - S.joinedAt;
+    if (!S.g && (waited > (host ? 20000 : 3000) || (waited > 3000 && S.peers.length > 1))) return leaveTable();
+  }
+  // a pending resign or leave whose button is gone (the game ended, or we're no longer seated) is let go
+  if (S.confirm) {
+    const v = view();
+    if (!(v.mine && !v.out && v.moves.length)) { S.confirm = null; clearTimeout(armTimer); }
+  }
+  saveResume();
+  publish();
+  render();
+  transitions();
+}
+
+function claim(sk) {
+  const g = S.g;
+  S.wantSeat = null;
+  if (!g || !S.me.peer || myColor(g)) return;
+  if (seatHere(g[sk])) return;            // someone is sitting there
+  S.g = { ...g, [sk]: mySeat() };
+}
+
+let resumeKey = '';
+function saveResume() {
+  // keep the seat we're on our way back to, so a reload before the table arrives doesn't forget it
+  const r = S.mode === 'table' ? { code: S.code, seat: myColor(S.g) || S.wantSeat } : null;
+  const k = JSON.stringify(r);
+  if (k === resumeKey) return;
+  resumeKey = k;
+  store.set('fivebeads.table', r, 'sessionStorage');
+}
+
+// ---- actions -----------------------------------------------------------------------------------
+function play(idx) {
+  const v = view();
+  if (!v.canPlace || idx < 0 || v.a.board[idx]) return;
+  S.armed = -1;
+  S.cursor = idx;
+  if (v.local) {
+    S.local = [...S.local, idx];
+    S.cleared = null;
+    store.set('fivebeads.local', S.local);
+  } else {
+    S.g = { ...S.g, m: S.g.m + enc(idx) };
+    S.hover = -1;
+  }
+  sync();
+  const after = view();
+  if (after.out && after.out.kind === 'five' && (after.local || after.out.winner === after.mine)) {
+    say('teelu', () => ['teelu', icon('sparkle', 'spark')]);
+  }
+}
+/** New game keeps the cleared game, so ↺ can bring it back (Ollune undoes instead of asking). */
+function newLocal() {
+  if (!S.local.length) return;
+  S.cleared = S.local;
+  S.local = [];
+  S.armed = -1;
+  S.preview = null;
+  store.set('fivebeads.local', S.local);
+  sync();
+}
+function undoLocal() {
+  if (S.local.length) S.local = S.local.slice(0, -1);
+  else if (S.cleared) { S.local = S.cleared; S.cleared = null; }
+  else return;
+  S.armed = -1;
+  store.set('fivebeads.local', S.local);
+  sync();
+}
+
+// two-press confirm for resign and leave: the second press counts between 350 ms and 4 s after the first
+let armTimer = 0;
+function arm(kind) {
+  S.confirm = { kind, at: Date.now() };
+  clearTimeout(armTimer);
+  armTimer = setTimeout(disarm, 4000);
+  announce(kind === 'resign' ? 'Press again within 4 seconds to resign.' : 'Press again within 4 seconds to leave. Your seat opens.');
+  render();
+}
+function disarm() {
+  clearTimeout(armTimer);
+  if (!S.confirm) return;
+  S.confirm = null;
+  render();
+}
+function pressArmed(kind, act) {
+  if (S.confirm && S.confirm.kind === kind) {
+    if (Date.now() - S.confirm.at < 350) return;
+    clearTimeout(armTimer);
+    S.confirm = null;
+    return act();
+  }
+  arm(kind);
+}
+function resign() {
+  const v = view();
+  if (!v.mine || v.out) return;
+  S.g = { ...S.g, x: v.mine };
+  sync();
+}
+function askRematch() { if (S.g) { S.rm = S.g.id; sync(); } }
+
+function tableCodes() { const s = new Set(); for (const p of S.peers) { const t = tableOf(p); if (t) s.add(t); } return s; }
+function newTable() {
+  if (!S.room || !S.me.peer) return;
+  const used = tableCodes();
+  let code;
+  do code = String(1000 + Math.floor(Math.random() * 9000)); while (used.has(code));
+  Object.assign(S, { mode: 'table', code, rm: null, hover: -1, armed: -1, wantSeat: null, confirm: null, joinedAt: Date.now() });
+  S.g = { id: 1, p: mySeat(), l: null, m: '', x: null };
+  sync();
+}
+function enterTable(code, seat) {
+  if (!S.room || !S.me.peer) return;
+  if (S.mode === 'table' && S.code === code) { S.wantSeat = seat || null; return sync(); }
+  Object.assign(S, { mode: 'table', code, g: null, rm: null, hover: -1, armed: -1, wantSeat: seat || null, confirm: null, joinedAt: Date.now() });
+  setTimeout(sync, 3100);
+  if (host) setTimeout(sync, 20100);
+  sync();
+}
+function sit(sk) { S.wantSeat = sk; sync(); }
+function leaveTable() {
+  Object.assign(S, { mode: 'local', code: null, g: null, rm: null, hover: -1, armed: -1, wantSeat: null, confirm: null });
+  S.present = new Set();
+  S.parts = [];
+  sync();
+}
+
+// ---- drawing helpers ------------------------------------------------------------------------------
+const NS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs, parent) => {
+  const e = document.createElementNS(NS, tag);
+  if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+};
+const NSS = { 'vector-effect': 'non-scaling-stroke' };
+
+/** A bead centred on 0,0: peach is a filled core, lilac a halo of eight slots around a pip. */
+function drawStone(parent, sk) {
+  if (sk === 'p') {
+    svgEl('circle', { r: 0.38, class: 'core' }, parent);
+  } else {
+    svgEl('circle', { r: 0.4, class: 'halo-ground' }, parent);
+    svgEl('circle', { r: 0.315, class: 'halo', transform: 'rotate(-86)' }, parent);
+    svgEl('circle', { r: 0.085, class: 'pip' }, parent);
+  }
+}
+function glyph(sk, cls) {
+  const s = svgEl('svg', { viewBox: '-0.5 -0.5 1 1', class: 'glyph' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', focusable: 'false' });
+  drawStone(s, sk);
+  return s;
+}
+
+// Ollune's glyph set (self/src/ui/Glyph.tsx), plus Five Beads' own in the same hand: 24×24, 1.5px stroke, round caps, currentColor.
+const ST = 'fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"';
+const FILL = 'fill="currentColor"';
+const ICONS = {
+  // Ollune
+  add: `<path d="M12 6v12M6 12h12" ${ST}/>`,
+  undo: `<path d="M7.5 9.5A6 6 0 1 1 6.5 14" ${ST}/><path d="M7.5 5.5v4h4" ${ST}/>`,
+  next: `<path d="M10 6l6 6-6 6" ${ST}/>`,
+  sparkle: `<path d="M12 4c.6 4.2 3.8 7.4 8 8-4.2.6-7.4 3.8-8 8-.6-4.2-3.8-7.4-8-8 4.2-.6 7.4-3.8 8-8z" ${ST}/>`,
+  rest: `<path d="M15.5 5.5a7 7 0 1 0 3 9.5 5.5 5.5 0 0 1-3-9.5z" ${ST}/>`,
+  done: `<circle cx="12" cy="12" r="6.5" ${FILL}/>`,
+  routine: `<circle cx="12" cy="12" r="7" ${ST} stroke-dasharray="3.2 2.3"/>`,
+  repeat: `<path d="M17.5 9.5A6 6 0 0 0 6.6 8.4M6.5 14.5a6 6 0 0 0 10.9 1.1" ${ST}/><path d="M6.2 5v3.6h3.6M17.8 19v-3.6h-3.6" ${ST}/>`,
+  question: `<path d="M9.2 9.2a2.9 2.9 0 1 1 4.2 2.6c-.9.5-1.4 1.2-1.4 2.2" ${ST}/><circle cx="12" cy="17.5" r="1" ${FILL}/>`,
+  dots: `<circle cx="6.5" cy="13" r="1.3" ${FILL}/><circle cx="12" cy="13" r="1.3" ${FILL}/><circle cx="17.5" cy="13" r="1.3" ${FILL}/>`,
+  check: `<path d="M6 12.5l4 4 8-9" ${ST}/>`,
+  // Five Beads
+  me: `<circle cx="12" cy="7.5" r="3.4" ${FILL}/><path d="M5.5 19.5a6.5 6.5 0 0 1 13 0z" ${FILL} stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>`,
+  person: `<circle cx="12" cy="7.5" r="3" ${ST}/><path d="M5.5 19.5a6.5 6.5 0 0 1 13 0" ${ST}/>`,
+  eye: `<path d="M3.5 12c2-3.6 5-5.5 8.5-5.5s6.5 1.9 8.5 5.5c-2 3.6-5 5.5-8.5 5.5S5.5 15.6 3.5 12z" ${ST}/><circle cx="12" cy="12" r="2.4" ${FILL}/>`,
+  five: `<path d="M5 19 19 5" ${ST}/><circle cx="5" cy="19" r="1.8" ${FILL}/><circle cx="8.5" cy="15.5" r="1.8" ${FILL}/><circle cx="12" cy="12" r="1.8" ${FILL}/><circle cx="15.5" cy="8.5" r="1.8" ${FILL}/><circle cx="19" cy="5" r="1.8" ${FILL}/>`,
+  even: `<path d="M6.5 9.5h11M6.5 14.5h11" ${ST}/>`,
+  flag: `<path d="M7 20V4.8" ${ST}/><path d="M7 5.5c3.6-1.8 6.4 1.8 10 0V13c-3.6 1.8-6.4-1.8-10 0" ${ST}/>`,
+  leave: `<path d="M13.5 5h-5A2.5 2.5 0 0 0 6 7.5v9A2.5 2.5 0 0 0 8.5 19h5" ${ST}/><path d="M11 12h8.5M16.5 9l3 3-3 3" ${ST}/>`,
+  link: `<path d="M10.5 13.5a3.5 3.5 0 0 0 5 .3l2.7-2.7a3.54 3.54 0 0 0-5-5l-1.4 1.4" ${ST}/><path d="M13.5 10.5a3.5 3.5 0 0 0-5-.3l-2.7 2.7a3.54 3.54 0 0 0 5 5l1.4-1.4" ${ST}/>`,
+  board: `<rect x="4.5" y="4.5" width="15" height="15" rx="2.5" ${ST}/><path d="M9.5 4.5v15M14.5 4.5v15M4.5 9.5h15M4.5 14.5h15" ${ST}/><circle cx="14.5" cy="9.5" r="1.8" ${FILL}/>`,
+  device: `<rect x="7" y="3.5" width="10" height="17" rx="2.5" ${ST}/><circle cx="12" cy="8.75" r="2" ${FILL}/><circle cx="12" cy="15.25" r="2" ${ST}/>`,
+  retry: `<path d="M16.5 9.5A6 6 0 1 0 17.5 14" ${ST}/><path d="M16.5 5.5v4h-4" ${ST}/>`,
+};
+function icon(name, cls) {
+  const s = svgEl('svg', { viewBox: '0 0 24 24', class: 'icon' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true', focusable: 'false' });
+  s.innerHTML = ICONS[name] || '';
+  if (name === 'dots') s.classList.add('dots');
+  return s;
+}
+
+// ---- board drawing ------------------------------------------------------------------------------
+const svg = document.getElementById('board');
+const L = {};
+function buildBoard() {
+  const defs = svgEl('defs', null, svg);
+  defs.innerHTML =
+    '<radialGradient id="g-hearth"><stop offset="0" style="stop-color:var(--rose);stop-opacity:.9"/><stop offset=".5" style="stop-color:var(--rose);stop-opacity:.3"/><stop offset="1" style="stop-color:var(--rose);stop-opacity:0"/></radialGradient>' +
+    '<radialGradient id="g-win"><stop offset="0" style="stop-color:var(--butter);stop-opacity:.5"/><stop offset=".45" style="stop-color:var(--butter);stop-opacity:.2"/><stop offset="1" style="stop-color:var(--butter);stop-opacity:0"/></radialGradient>';
+  svgEl('circle', { cx: 8, cy: 8, r: 6.6, fill: 'url(#g-hearth)', class: 'breath' }, svg);
+  const grid = svgEl('g', { class: 'grid' }, svg);
+  for (let k = 1; k <= N; k++) {
+    const edge = k === 1 || k === N ? 'edge' : '';
+    svgEl('line', { x1: 1, y1: k, x2: N, y2: k, class: edge, ...NSS }, grid);
+    svgEl('line', { x1: k, y1: 1, x2: k, y2: N, class: edge, ...NSS }, grid);
+  }
+  for (const [x, y] of [[4, 4], [12, 4], [4, 12], [12, 12]]) svgEl('circle', { cx: x, cy: y, r: 0.075, class: 'hoshi' }, svg);
+  svgEl('circle', { cx: 8, cy: 8, r: 0.14, class: 'tengen', ...NSS }, svg);
+  L.glow = svgEl('g', null, svg);
+  L.cleared = svgEl('g', { class: 'cleared' }, svg);
+  L.stones = svgEl('g', { id: 'stones' }, svg);
+  L.thread = svgEl('g', null, svg);
+  L.marks = svgEl('g', { 'pointer-events': 'none' }, svg);
+  L.last = svgEl('circle', { r: 0.52, class: 'seat-ring', visibility: 'hidden', ...NSS }, L.marks);
+  L.undo = svgEl('circle', { r: 0.46, class: 'undo-ring', visibility: 'hidden', ...NSS }, L.marks);
+  L.hint = svgEl('g', { transform: 'translate(8 8)', visibility: 'hidden' }, L.marks);
+  drawStone(svgEl('g', { class: 'hint-bead' }, L.hint), 'p');
+  svgEl('circle', { r: 0.52, class: 'hint-ring', ...NSS }, L.hint);
+  L.ghost = svgEl('g', { class: 'ghost', visibility: 'hidden' }, L.marks);
+  L.them = svgEl('circle', { r: 0.46, class: 'their-cursor', visibility: 'hidden', ...NSS }, L.marks);
+  L.kb = svgEl('circle', { r: 0.5, class: 'kb-cursor', visibility: 'hidden', ...NSS }, L.marks);
+
+  const mark = document.getElementById('mark');
+  drawStone(svgEl('g', null, mark), 'p');
+  drawStone(svgEl('g', { transform: 'translate(0.72 0)' }, mark), 'l');
+}
+
+const at = (node, idx) => { const [x, y] = xy(idx); node.setAttribute('cx', x + 1); node.setAttribute('cy', y + 1); };
+const showAt = (node, idx) => { if (idx >= 0) { at(node, idx); node.setAttribute('visibility', 'visible'); } else node.setAttribute('visibility', 'hidden'); };
+
+const drawn = [];
+let boardReady = false;
+function syncStones(moves) {
+  let k = 0;
+  while (k < drawn.length && k < moves.length && drawn[k].idx === moves[k]) k++;
+  const fresh = boardReady && moves.length - k <= 2;
+  while (drawn.length > k) drawn.pop().node.remove();
+  for (; k < moves.length; k++) {
+    const idx = moves[k], [x, y] = xy(idx);
+    const outer = svgEl('g', { transform: `translate(${x + 1} ${y + 1})` }, L.stones);
+    const inner = svgEl('g', { class: fresh ? 'stone new' : 'stone' }, outer);
+    drawStone(inner, k % 2 ? 'l' : 'p');
+    drawn.push({ idx, node: outer });
+  }
+  boardReady = true;
+}
+
+let clearedKey = '';
+function syncCleared(moves) {
+  const key = moves ? moves.join(',') : '';
+  if (key === clearedKey) return;
+  clearedKey = key;
+  L.cleared.replaceChildren();
+  if (!moves) return;
+  moves.forEach((idx, k) => {
+    const [x, y] = xy(idx);
+    drawStone(svgEl('g', { transform: `translate(${x + 1} ${y + 1})` }, L.cleared), k % 2 ? 'l' : 'p');
+  });
+}
+
+let winKey = '';
+function syncWin(out) {
+  const key = out && out.line ? out.line.join(',') : '';
+  if (key === winKey) return;
+  winKey = key;
+  L.glow.replaceChildren();
+  L.thread.replaceChildren();
+  if (!key) return;
+  for (const i of out.line) {
+    const [x, y] = xy(i);
+    svgEl('circle', { cx: x + 1, cy: y + 1, r: 0.9, fill: 'url(#g-win)', class: 'win-glow' }, L.glow);
+  }
+  const [ax, ay] = xy(out.line[0]), [bx, by] = xy(out.line[out.line.length - 1]);
+  const ln = svgEl('line', { x1: ax + 1, y1: ay + 1, x2: bx + 1, y2: by + 1, class: 'thread' }, L.thread);
+  const len = Math.hypot(bx - ax, by - ay) + 0.01;
+  ln.style.strokeDasharray = len;
+  ln.style.strokeDashoffset = len;
+  requestAnimationFrame(() => requestAnimationFrame(() => { ln.style.strokeDashoffset = 0; }));
+}
+
+let ghostSide = '';
+function renderBoard() {
+  const v = view();
+  syncStones(v.moves);
+  syncWin(v.out);
+  showAt(L.last, v.moves.length ? v.moves[v.moves.length - 1] : -1);
+
+  // New game / Undo previews (local only)
+  const pvClear = v.local && S.preview === 'clear' && v.moves.length > 0;
+  const pvUndo = v.local && S.preview === 'undo' && v.moves.length > 0;
+  svg.classList.toggle('pv-clear', pvClear);
+  drawn.forEach((d, k) => d.node.classList.toggle('pv-last', pvUndo && k === drawn.length - 1));
+  showAt(L.undo, pvUndo ? v.moves[v.moves.length - 1] : -1);
+  syncCleared(v.local && S.preview === 'undo' && !v.moves.length && S.cleared ? S.cleared : null);
+
+  const hov = S.armed >= 0 ? S.armed : S.hover;
+  const ghostOn = v.canPlace && hov >= 0 && !v.a.board[hov];
+  if (ghostOn) {
+    if (ghostSide !== v.turn) { L.ghost.replaceChildren(); drawStone(L.ghost, v.turn); ghostSide = v.turn; }
+    const [x, y] = xy(hov);
+    L.ghost.setAttribute('transform', `translate(${x + 1} ${y + 1})`);
+    L.ghost.setAttribute('visibility', 'visible');
+    L.ghost.classList.toggle('armed', S.armed >= 0);
+  } else L.ghost.setAttribute('visibility', 'hidden');
+
+  // the empty board invites the first bead at its centre
+  L.hint.setAttribute('visibility', v.canPlace && !v.moves.length && !ghostOn && !(S.kbd && document.activeElement === svg) ? 'visible' : 'hidden');
+
+  // where the other player is pointing, from their presence
+  let them = -1;
+  if (!v.local && v.g && !v.out && v.both && v.turn !== v.mine) {
+    const seat = v.g[v.turn];
+    const part = seat && S.parts.find((p) => p.peer === seat.peer);
+    const h = part && part.presence.h;
+    if (Number.isInteger(h) && h >= 0 && h < CELLS && !v.a.board[h]) them = h;
+    L.them.setAttribute('class', 'their-cursor ' + v.turn);
+  }
+  showAt(L.them, them);
+  showAt(L.kb, S.kbd && document.activeElement === svg ? S.cursor : -1);
+  svg.classList.toggle('can', v.canPlace);
+  $('plate').classList.toggle('yours', !v.local && v.canPlace);
+}
+
+// ---- sheet -----------------------------------------------------------------------------------------
+function $(id) { return document.getElementById(id); }
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  if (props) for (const k in props) {
+    const v = props[k];
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else if (k.startsWith('on')) e[k] = v;          // a property, so morph() can carry it over
+    else if (k === 'style') e.style.cssText = v;
+    else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) e.append(c);
+  return e;
+}
+// The sheet is re-described from state on every change, then morphed into the live DOM: nodes that are
+// still there keep their identity, so focus stays put, a press that began on a button still lands on it,
+// running animations (the confirm drain, the beats) keep going, and class changes get their transitions.
+// Children match by data-k / data-key, otherwise by position and tag.
+const HANDLERS = ['onclick', 'onkeydown', 'onpointerenter', 'onpointerleave', 'onfocus', 'onblur'];
+const keyOf = (n) => (n.nodeType === 1 ? n.getAttribute('data-k') || n.getAttribute('data-key') : null);
+const sameKind = (a, b) => a.nodeType === b.nodeType && (a.nodeType !== 1 || (a.tagName === b.tagName && a.namespaceURI === b.namespaceURI));
+function morphNode(o, n) {
+  if (o.nodeType !== 1) { if (o.nodeValue !== n.nodeValue) o.nodeValue = n.nodeValue; return; }
+  const pulsing = o.classList.contains('pulse');
+  for (const a of [...o.attributes]) if (!n.hasAttribute(a.name)) o.removeAttribute(a.name);
+  for (const a of [...n.attributes]) if (o.getAttribute(a.name) !== a.value) o.setAttribute(a.name, a.value);
+  if (pulsing) o.classList.add('pulse');
+  for (const p of HANDLERS) if (o[p] !== n[p]) o[p] = n[p];
+  morph(o, [...n.childNodes]);
+}
+function morph(parent, kids) {
+  const next = kids.flat().filter((k) => k != null && k !== false).map((k) => (typeof k === 'string' ? document.createTextNode(k) : k));
+  const old = [...parent.childNodes];
+  const keyed = new Map();
+  for (const o of old) { const k = keyOf(o); if (k) keyed.set(k, o); }
+  const used = new Set();
+  let cursor = 0;
+  const result = next.map((n) => {
+    const k = keyOf(n);
+    let o = null;
+    if (k) o = keyed.get(k) || null;
+    else {
+      while (cursor < old.length && (used.has(old[cursor]) || keyOf(old[cursor]))) cursor++;
+      if (cursor < old.length) o = old[cursor];
+    }
+    if (o && !used.has(o) && sameKind(o, n)) { used.add(o); if (!k) cursor++; morphNode(o, n); return o; }
+    return n;
+  });
+  result.forEach((n, i) => { if (parent.childNodes[i] !== n) parent.insertBefore(n, parent.childNodes[i] || null); });
+  while (parent.childNodes.length > result.length) parent.lastChild.remove();
+}
+const bead = (sk, ghost) => h('span', { class: 'bead' + (ghost ? ' ghost' : '') }, glyph(sk));
+const mark = (name, cls) => icon(name, cls);
+
+/** Who sits in a seat, without words: your solid figure (plus your name), their name, or a hollow figure. */
+function whoNodes(seat) {
+  if (!seat) return [];
+  if (seat.peer === S.me.peer) {
+    const n = nameOf(S.me.by);
+    return [icon('me', 'me'), n ? h('span', { class: 'name', text: n }) : null];
+  }
+  const n = nameOf(seat.by);
+  return [n ? h('span', { class: 'name', text: n }) : icon('person', 'person')];
+}
+
+function statusText(v) {
+  if (v.local) {
+    if (v.out) return v.out.kind === 'five' ? `${SIDE[v.out.winner]} wins with five in a row.` : 'The board is full. It’s a draw.';
+    return v.moves.length ? `${SIDE[v.turn]} to move.` : 'Peach moves first. Place a bead on any point.';
+  }
+  const g = v.g;
+  if (!g) return 'Joining the table.';
+  const nm = (sk) => (sk === v.mine ? 'You' : label(g[sk], sk));
+  if (v.out) {
+    if (v.out.kind === 'five') return v.out.winner === v.mine ? 'You win with five in a row.' : `${nm(v.out.winner)} wins with five in a row.`;
+    if (v.out.kind === 'resign') {
+      if (v.out.loser === v.mine) return 'You resigned.';
+      return `${nm(v.out.loser)} resigned. ${v.out.winner === v.mine ? 'You win.' : nm(v.out.winner) + ' wins.'}`;
+    }
+    return 'The board is full. It’s a draw.';
+  }
+  if (!v.both) {
+    if (v.mine) {
+      const opp = OTHER[v.mine];
+      if (g[opp] && v.moves.length) return `${label(g[opp], opp)} left. Anyone can take the open seat and play on.`;
+      return host ? 'Waiting for an opponent. Send a friend the invite link.' : 'Waiting for an opponent. Anyone with this page open can sit down.';
+    }
+    return v.moves.length ? 'A seat is open. Sit down to play on.' : 'A seat is open. Sit down to play.';
+  }
+  if (v.canPlace) return v.moves.length ? 'Your move.' : 'Your move. Peach opens the game.';
+  if (v.mine) return `${nm(OTHER[v.mine])} is thinking.`;
+  return `${nm(v.turn)} to move.`;
+}
+
+function rematchNote(v) {
+  if (v.local || !v.g || !v.out || !v.mine) return '';
+  const opp = v.g[OTHER[v.mine]];
+  const oppWants = wantsRematch(opp, v.g.id);
+  if (oppWants && S.rm !== v.g.id) return `${label(opp, OTHER[v.mine])} wants a rematch.`;
+  if (S.rm === v.g.id) return seatHere(opp) ? `Rematch asked. Waiting for ${label(opp, OTHER[v.mine])}.` : 'Rematch asked, but your opponent has left.';
+  return '';
+}
+
+function countOf(v, sk) {
+  let n = 0;
+  for (let i = 0; i < CELLS; i++) if (v.a.board[i] === COLOR[sk]) n++;
+  return n;
+}
+
+// When a beat first appeared, so a re-render resumes it rather than restarting it (beat3 rests after 3 cycles, beat8 after ~20 s).
+const seenAt = new Map();
+function beatStyle(key) {
+  if (!seenAt.has(key)) seenAt.set(key, Date.now());
+  return `--beat-at: -${Date.now() - seenAt.get(key)}ms`;
+}
+
+function seatRow(sk, v) {
+  const count = countOf(v, sk);
+  const out = v.out;
+  const words = [SIDE[sk]];
+  const marks = [];
+  let cls = 'seat ' + sk, who = [], beadNode = bead(sk), tag = 'li', onclick = null, showCount = count > 0;
+
+  if (!v.local && !v.g) {
+    // joining: skeleton rows
+    return h('li', { class: cls, 'data-key': 'seat-' + sk, 'aria-label': `${SIDE[sk]}, joining` }, bead(sk, true), h('span', { class: 'who' }, icon('dots')), h('span'), h('span'));
+  }
+
+  const seat = v.local ? null : v.g[sk];
+  const here = v.local || seatHere(seat);
+  const mineSeat = !!seat && seat.peer === S.me.peer;
+  const turnHere = !out && v.turn === sk;
+
+  if (!v.local) {
+    who = whoNodes(seat);
+    if (seat) words.push(label(seat, sk));
+    if (mineSeat) cls += ' mine';
+  }
+
+  if (!here) {
+    if (!v.mine) {
+      // a spectator can take it: the whole row is the sit button
+      tag = 'button';
+      onclick = () => sit(sk);
+      // Ollune's slit-beat for 3 cycles when the seat opens: the + is the whole "sit down" instruction
+      beadNode = h('span', { class: 'chip-add beat3', style: beatStyle(`sit:${S.code}:${v.g.id}:${sk}`) }, icon('add'));
+      if (!seat) who = [icon('me', 'me ghost-me')];
+      words.length = 0;
+      words.push(`Sit as ${SIDE[sk]}${v.moves.length ? ' and play on' : ''}`);
+    } else {
+      beadNode = bead(sk, true);
+      if (!seat) { marks.push(icon('dots')); words.push('seat open, waiting for an opponent'); }
+    }
+    if (seat) {
+      cls += ' gone';
+      marks.push(mark('leave'));
+      if (tag === 'li') words.push('left, the seat is open');
+      if (turnHere) cls += ' turn paused';
+    }
+  } else if (turnHere && v.both) {
+    cls += ' turn';
+    if (!v.local && !mineSeat) { marks.push(icon('dots')); words.push('thinking'); }
+    else words.push(v.local ? 'to move' : 'your move');
+  }
+
+  if (out) {
+    if (out.winner === sk) {
+      cls += ' won';
+      marks.push(mark(out.kind === 'five' ? 'five' : 'sparkle', 'butter'));
+      words.push(out.kind === 'five' ? 'won with five in a row' : 'won, the other player resigned');
+    }
+    if (out.kind === 'resign' && out.loser === sk) { marks.push(mark('flag')); words.push('resigned'); }
+    if (out.kind === 'draw') { marks.push(mark('even')); words.push('draw'); }
+    if (!v.local && seat && wantsRematch(seat, v.g.id)) {
+      const gone = !seatHere(v.g[OTHER[sk]]);
+      marks.push(mark('repeat', mineSeat && gone ? 'ink faint' : 'ink'));
+      words.push('asked for a rematch');
+    } else if (!v.local && v.mine && !mineSeat && S.rm === v.g.id && seatHere(seat)) {
+      marks.push(icon('dots'));
+    }
+  }
+
+  // what a pending resign or leave would do
+  if (S.confirm && !v.local && v.mine) {
+    if (S.confirm.kind === 'resign') {
+      if (mineSeat) marks.push(mark('flag', 'half'));
+      else if (seat) { cls += ' won-ghost'; marks.push(mark('sparkle', 'butter half')); }
+    } else if (S.confirm.kind === 'leave' && mineSeat) {
+      beadNode = bead(sk, true);
+      marks.push(mark('leave', 'half'));
+    }
+  }
+
+  if (showCount) words.push(`${count} beads`);
+  const row = h(tag, { class: cls, type: tag === 'button' ? 'button' : null, 'data-k': tag === 'button' ? 'sit-' + sk : null, 'aria-label': words.filter(Boolean).join(', '), onclick },
+    beadNode,
+    h('span', { class: 'who' }, who),
+    h('span', { class: 'marks' }, marks),
+    h('span', { class: 'count', 'aria-hidden': 'true', text: showCount ? String(count) : '' }));
+  if (tag === 'li') { row.setAttribute('data-key', 'seat-' + sk); return row; }
+  return h('li', { 'data-key': 'seat-' + sk }, row);   // a list holds only list items
+}
+
+function gbtn(name, onclick, o = {}) {
+  const b = h('button', {
+    type: 'button',
+    class: 'gbtn' + (o.primary ? ' primary' : '') + (o.cls ? ' ' + o.cls : ''),
+    'data-k': o.k, 'aria-label': o.label,
+    'aria-pressed': o.pressed == null ? null : String(o.pressed),
+    disabled: !!o.disabled, onclick,
+  }, icon(name));
+  if (o.style) b.style.cssText = o.style;
+  if (o.preview) {
+    b.onpointerenter = b.onfocus = () => { S.preview = o.preview; renderBoard(); };
+    b.onpointerleave = b.onblur = () => { if (S.preview === o.preview) { S.preview = null; renderBoard(); } };
+  }
+  return b;
+}
+/** A destructive button that needs a second press: armed, it widens into [glyph ✓] with an outline draining over 4 s. */
+function armedBtn(kind, name, act, label, k) {
+  const armed = S.confirm && S.confirm.kind === kind;
+  // timed from the first press, so a re-render mid-way shows the time actually left
+  const since = armed ? `animation-delay: -${Date.now() - S.confirm.at}ms` : '';
+  const b = gbtn(name, () => pressArmed(kind, act), { k, cls: armed ? 'armed' : '', style: since, label: armed ? (kind === 'resign' ? 'Confirm resign' : 'Confirm leave, your seat opens') : label });
+  if (armed) {
+    b.append(icon('check', 'chk'));
+    const d = svgEl('svg', { class: 'drain', 'aria-hidden': 'true', preserveAspectRatio: 'none' });
+    svgEl('rect', { pathLength: 100, style: since, ...NSS }, d);
+    b.append(d);
+  }
+  return b;
+}
+
+function actionButtons(v) {
+  const start = [], end = [];
+  if (v.local) {
+    start.push(gbtn('undo', undoLocal, { k: 'undo', label: S.local.length ? 'Undo last bead' : 'Restore the cleared game', disabled: !S.local.length && !S.cleared, preview: 'undo' }));
+    start.push(gbtn('repeat', newLocal, { k: 'new', label: 'New game', primary: !!v.out, disabled: !S.local.length, preview: 'clear' }));
+    return [start, end];
+  }
+  const g = v.g;
+  if (g && v.mine) {
+    const opp = g[OTHER[v.mine]];
+    if (v.out) {
+      const asked = S.rm === g.id;
+      const theyAsked = wantsRematch(opp, g.id);
+      start.push(gbtn('repeat', askRematch, {
+        k: 'rematch', primary: !asked, pressed: asked, disabled: asked || !seatHere(opp),
+        cls: theyAsked && !asked ? 'beat8' : '',
+        style: theyAsked && !asked ? beatStyle(`rm:${S.code}:${g.id}`) : '',
+        label: asked ? `Rematch asked, waiting for ${label(opp, OTHER[v.mine])}` : 'Rematch, sides swap',
+      }));
+    } else if (v.moves.length) {
+      end.push(armedBtn('resign', 'flag', resign, 'Resign', 'resign'));
+    }
+  }
+  const seatedMidGame = !!(g && v.mine && !v.out && v.moves.length);
+  end.push(seatedMidGame ? armedBtn('leave', 'leave', leaveTable, 'Leave table', 'leave') : gbtn('leave', leaveTable, { k: 'leave', label: 'Leave table' }));
+  return [start, end];
+}
+
+let lastOthers = 0;
+function presenceStack() {
+  const others = Math.max(0, S.peers.length - 1);
+  const kids = [icon('me', 'me')];
+  if (others <= 4) for (let i = 0; i < others; i++) kids.push(icon('person', 'person' + (i >= lastOthers ? ' arrive' : '')));
+  else kids.push(icon('person', 'person'), h('span', { class: 'n', text: String(others) }));
+  lastOthers = others;
+  return h('span', { class: 'stack', role: 'img', 'aria-label': others ? `${others} other${others === 1 ? '' : 's'} here` : 'just you here' }, kids);
+}
+
+let copyTimer = 0;
+function inviteNodes() {
+  if (!host || !S.room) return [];
+  const alone = S.peers.length <= 1;
+  return [h('span', { class: 'invite' },
+    h('span', { role: 'img', 'aria-label': 'Room ' + spoken(host.display), text: host.display }),
+    h('button', {
+      type: 'button', class: 'round' + (alone && !S.invite.used ? ' beat' : ''), 'data-k': 'invite',
+      'aria-label': 'Copy invite link', onclick: copyInvite,
+    }, icon(S.invite.copied ? 'check' : 'link')))];
+}
+async function copyInvite() {
+  const url = host.invite();
+  S.invite.used = true;
+  const done = () => {
+    S.invite.copied = true;
+    S.invite.field = false;
+    announce('Invite link copied.');
+    render();
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => { S.invite.copied = false; render(); }, 2200);
+  };
+  if (navigator.share && matchMedia('(pointer: coarse)').matches) {
+    try { await navigator.share({ url }); return done(); } catch (e) { if (e && e.name === 'AbortError') return render(); }
+  }
+  try { await navigator.clipboard.writeText(url); return done(); } catch {}
+  S.invite.field = true;
+  render();
+  const f = $('invite-url');
+  if (f) { f.focus(); f.select(); }
+}
+
+function lobbyRows() {
+  const rows = [];
+  for (const code of [...tableCodes()].sort()) {
+    const c = code === S.code && S.mode === 'table' ? { g: S.g, present: S.present, parts: S.parts } : canonFor(code);
+    const g = c.g;
+    const a = g ? analyze(dec(g.m)) || EMPTY : EMPTY;
+    const out = g ? outcome(g, a) : null;
+    const seated = {};
+    for (const sk of SEATS) seated[sk] = g && g[sk] && c.present.has(g[sk].peer) ? g[sk] : null;
+    const open = SEATS.find((sk) => !seated[sk]);
+    const watching = c.parts.filter((p) => !SEATS.some((sk) => seated[sk] && seated[sk].peer === p.peer)).length;
+    const here = S.mode === 'table' && S.code === code;
+    const iWatch = here && !(g && myColor(g));
+    const words = [`Table ${spoken(fmtCode(code))}`];
+
+    const meta = [];
+    if (!g) { meta.push(h('span', { class: 'grp' }, icon('dots', 'still'))); words.push('starting'); }
+    else if (out) {
+      meta.push(h('span', { class: 'grp' }, out.kind === 'five' ? icon('five', 'butter') : out.kind === 'resign' ? icon('flag') : icon('even')));
+      words.push(out.kind === 'five' ? `finished, ${SIDE[out.winner]} won with five` : out.kind === 'resign' ? `finished, ${SIDE[out.loser]} resigned` : 'finished, a draw');
+    }
+    if (watching) { meta.push(h('span', { class: 'grp' }, icon('eye'), String(watching))); words.push(`${watching} watching`); }
+
+    const players = SEATS.map((sk) => {
+      const s = seated[sk];
+      const n = g ? countOf({ a }, sk) : 0;
+      let id;
+      if (!s) { id = []; words.push(`${SIDE[sk]} open seat`); }
+      else if (s.peer === S.me.peer) { id = [icon('me', 'me')]; words.push(`${SIDE[sk]} you`); }
+      else { const nm = nameOf(s.by); id = [nm ? h('span', { text: nm }) : icon('person', 'person')]; words.push(`${SIDE[sk]} ${nm || 'a guest'}`); }
+      if (s && out && out.winner === sk) id.push(icon('sparkle', 'spark butter'));
+      if (n) words.push(`${n} beads`);
+      return h('div', { class: 'tp' + (s ? '' : ' open') }, glyph(sk), h('span', { class: 'id' }, id), h('span', { class: 'cnt', text: s && n ? String(n) : '' }));
+    });
+
+    let action;
+    if (here) { action = iWatch ? h('span', { class: 'here-me' }, icon('me', 'me')) : h('span'); words.push(iWatch ? 'you are watching' : 'you are at this table'); }
+    else if (open) action = h('button', { type: 'button', class: 'chip add ' + open, 'data-k': 'sit-' + code, 'aria-label': `Sit as ${SIDE[open]} at table ${spoken(fmtCode(code))}`, onclick: () => enterTable(code, open) }, icon('add'));
+    else action = h('button', { type: 'button', class: 'chip', 'data-k': 'watch-' + code, 'aria-label': `Watch table ${spoken(fmtCode(code))}`, onclick: () => enterTable(code, null) }, icon('eye'));
+
+    rows.push(h('li', { class: 'trow' + (here ? ' here' : ''), 'data-key': 'table-' + code, 'aria-label': words.join(', ') },
+      h('div', { class: 'tcode' }, h('b', { text: fmtCode(code) }), h('span', { class: 'tmeta' }, meta)),
+      h('div', { class: 'tplayers' }, players),
+      action));
+  }
+  return rows;
+}
+
+let gameKey = '', lobbyKey = '', statusSaid = '';
+function renderSheet() {
+  const v = view();
+  // status for screen readers only; the screen shows it on the seats and the board
+  const status = [statusText(v), rematchNote(v)].filter(Boolean).join(' ');
+  if (status !== statusSaid) { statusSaid = status; $('status').textContent = status; }
+
+  // where focus was, so it can be put somewhere sensible if its control goes away
+  const sheet = document.querySelector('.sheet');
+  const before = document.activeElement;
+  const focusK = before && sheet.contains(before) && before.dataset ? before.dataset.k : null;
+
+  // connection: ● online, ◌ connecting, ☾ offline
+  const conn = $('conn');
+  const state = S.room === undefined ? 'wait' : !S.room ? 'off' : S.connected ? 'on' : 'wait';
+  if (conn.dataset.state !== state || !conn.firstChild) {
+    conn.dataset.state = state;
+    conn.replaceChildren(icon(state === 'on' ? 'done' : state === 'wait' ? 'routine' : 'rest'));
+    conn.setAttribute('aria-label', state === 'on' ? 'online' : state === 'wait' ? 'connecting'
+      : host ? 'offline: online play could not start' : 'offline: online tables are not available here, two players can still share this device');
+  }
+
+  // the game: its own key, so activity elsewhere in the room doesn't touch it
+  const gk = JSON.stringify([S.mode, S.code, S.g, [...S.present].sort(), S.local, !!S.cleared, S.rm, S.confirm && S.confirm.kind,
+    S.me.peer, profVer, S.parts.map((p) => [p.peer, p.presence.rm])]);
+  if (gk !== gameKey) {
+    gameKey = gk;
+    // mode row: this device, or the table and its code, plus watchers
+    const watching = v.local ? 0 : S.parts.filter((p) => !(v.g && SEATS.some((sk) => v.g[sk] && v.g[sk].peer === p.peer && seatHere(v.g[sk])))).length;
+    morph($('mode'), [
+      v.local ? icon('device') : [icon('board'), h('span', { text: fmtCode(S.code) })],
+      watching ? h('span', { class: 'watch', 'data-key': 'watch', role: 'img', 'aria-label': `${watching} watching` }, icon('eye'), h('span', { text: String(watching) })) : null,
+    ]);
+    $('game').setAttribute('aria-label', v.local ? 'Game on this device' : `Table ${spoken(fmtCode(S.code))}`);
+
+    morph($('seats'), SEATS.map((sk) => seatRow(sk, v)));
+    const [start, end] = actionButtons(v);
+    const actions = $('actions');
+    actions.className = 'actions' + (S.confirm ? ' arming' : '');
+    morph(actions, [start, end.length ? h('span', { class: 'end', 'data-key': 'end' }, end) : null]);
+    for (const d of actions.querySelectorAll('.drain')) {
+      const hh = d.parentElement.offsetHeight || 36, w = Math.max(d.parentElement.offsetWidth, 72);
+      d.setAttribute('viewBox', `0 0 ${w} ${hh}`);
+      const r = d.firstChild;
+      r.setAttribute('x', 0.75); r.setAttribute('y', 0.75);
+      r.setAttribute('width', w - 1.5); r.setAttribute('height', hh - 1.5);
+      r.setAttribute('rx', (hh - 1.5) / 2);
+    }
+  }
+
+  // the tables
+  const tables = S.room ? [...tableCodes()].sort().map((code) => { const c = canonFor(code); return [code, code === S.code ? S.g : c.g, [...c.present].sort()]; }) : [];
+  const lk = JSON.stringify([S.room === undefined ? 0 : S.room ? 1 : -1, S.mode, S.code, myColor(S.g), S.me.peer, S.peers.length, profVer, tables, S.invite]);
+  if (lk !== lobbyKey) {
+    lobbyKey = lk;
+    const head = $('lobby-head'), lobby = $('lobby');
+    if (S.room === undefined) {
+      morph(head, []);
+      morph(lobby, [h('div', { class: 'wide', 'data-key': 'looking', role: 'status', 'aria-label': 'Looking for other players' }, icon('dots'))]);
+    } else if (!S.room) {
+      morph(head, []);
+      const why = host
+        ? 'Online play couldn’t start: the peer-to-peer library didn’t load. Check the connection and try again. Two players can still share this device.'
+        : 'Online tables aren’t available in this view. Open the page on claude.ai while signed in to play other people. Two players can still share this device.';
+      morph(lobby, [h('div', { class: 'wide quiet', 'data-key': 'offline', role: 'note', 'aria-label': why },
+        icon('rest'), icon('device', 'ink'),
+        host ? h('button', { type: 'button', class: 'round', 'data-k': 'retry', 'aria-label': 'Reload and try again', onclick: () => host.retry() }, icon('retry')) : null)]);
+    } else {
+      morph(head, [presenceStack(), inviteNodes()]);
+      const rows = lobbyRows();
+      const firstVisit = !store.get('fivebeads.started');
+      morph(lobby, [
+        S.invite.field && host ? h('div', { class: 'invite-field', 'data-key': 'invite-field' }, icon('link'),
+          h('input', {
+            id: 'invite-url', 'data-k': 'invite-url', readonly: true, value: host.invite(),
+            'aria-label': 'Invite link, selected, press Control C to copy',
+            onkeydown: (e) => { if (e.key === 'Escape') { S.invite.field = false; render(); $('legend-btn').focus(); } },
+          })) : null,
+        rows.length ? h('ul', { class: 'tlist', 'data-key': 'tlist' }, rows) : null,
+        h('button', {
+          type: 'button', class: 'wide' + (S.mode !== 'table' ? ' primary' : '') + (!rows.length && firstVisit ? ' beat3' : ''),
+          style: !rows.length && firstVisit ? beatStyle('newtable') : null,
+          'data-k': 'newtable', disabled: !S.me.peer, onclick: () => { store.set('fivebeads.started', 1); newTable(); },
+          'aria-label': S.mode === 'table' ? 'Start another table' : rows.length ? 'New table' : 'New table: it shows up here for everyone who has this page open',
+        }, icon('add', 'small'), icon('board')),
+      ]);
+    }
+  }
+
+  // Focus: morph keeps a surviving control focused. If the control was replaced, find it again; if it is gone
+  // or disabled now (New game after clearing, an asked Rematch, a confirmed Resign), land on the next sensible control.
+  const a = document.activeElement;
+  if (focusK && (!a || a === document.body || !a.isConnected || a.disabled)) {
+    let f = document.querySelector(`[data-k="${focusK}"]`);
+    if (!f || f.disabled) f = (focusK === 'new' && document.querySelector('[data-k="undo"]:not(:disabled)'))
+      || $('actions').querySelector('button:not(:disabled)') || $('board');
+    f.focus();
+    if (f.id === 'invite-url') f.select();
+  }
+}
+
+// A render can be asked for while one is running (removing a focused button fires focusout, for one);
+// it runs after the current one instead of inside it, so two renders never interleave their DOM writes.
+let rendering = false, renderAgain = false;
+function render() {
+  if (rendering) { renderAgain = true; return; }
+  rendering = true;
+  try { renderBoard(); renderSheet(); } finally { rendering = false; }
+  if (renderAgain) { renderAgain = false; render(); }
+}
+
+function announce(text) {
+  const s = $('say');
+  s.textContent = '';
+  requestAnimationFrame(() => { s.textContent = text; });
+}
+
+// ---- moments: pulses and the companion bubble -----------------------------------------------------
+function flash(el) {
+  if (!el) return;
+  el.classList.remove('pulse');
+  void el.getBoundingClientRect();
+  el.classList.add('pulse');
+  setTimeout(() => el.classList.remove('pulse'), 700);
+}
+const bub = { cur: null, shownAt: 0, queue: [], last: new Map(), timer: 0 };
+/** One bubble at a time; a new one waits until the current one has shown for 1.2 s; the same one never repeats within 8 s. */
+function say(key, parts) {
+  if ((bub.last.get(key) || 0) > Date.now() - 8000) return;
+  if (bub.queue.some((q) => q.key === key)) return;
+  bub.queue.push({ key, parts });
+  pump();
+}
+function pump() {
+  if (!bub.queue.length) return;
+  const since = Date.now() - bub.shownAt;
+  if (bub.cur && since < 1200) { clearTimeout(bub.timer); bub.timer = setTimeout(pump, 1200 - since); return; }
+  const next = bub.queue.shift();
+  bub.last.set(next.key, Date.now());
+  if (bub.cur) bub.cur.remove();
+  const b = h('div', { class: 'bubble', 'aria-hidden': 'true' }, next.parts());
+  $('wrap').appendChild(b);
+  bub.cur = b;
+  bub.shownAt = Date.now();
+  setTimeout(() => { if (bub.cur === b) { b.remove(); bub.cur = null; } pump(); }, 2900);
+}
+
+const greeted = new Set();
+let prev = null;
+/** Compares this moment with the last one and plays what changed: your-move pulse, greetings, rematch asks. */
+function transitions() {
+  const v = view();
+  const now = { key: v.local ? 'local' : `${S.code}:${v.g ? v.g.id : 0}`, table: S.code, mine: v.local ? null : v.mine, can: v.canPlace, over: !!v.out, opp: null, oppRm: false };
+  if (!v.local && v.g && v.mine) {
+    const os = v.g[OTHER[v.mine]];
+    now.opp = seatHere(os) ? os.peer : null;
+    now.oppRm = wantsRematch(os, v.g.id);
+  }
+  // one greeting per person per game per table
+  const met = (peer) => `${S.code}:${v.g.id}:${peer}`;
+  if (prev && prev.key === now.key) {
+    if (!v.local && now.can && !prev.can) {
+      flash(document.querySelector('#seats .seat.mine .bead'));
+      const plate = $('plate');
+      plate.classList.remove('glow'); void plate.offsetWidth; plate.classList.add('glow');
+    }
+    if (now.over && !prev.over) {
+      if (v.local) flash(document.querySelector('[data-k="new"]'));
+      if (!store.get('fivebeads.taught')) { store.set('fivebeads.taught', 1); flash($('legend-btn')); }
+      if (!v.local && v.out.kind === 'resign' && v.out.winner === v.mine) say('won', () => [icon('sparkle', 'spark')]);
+    }
+    if (now.opp && now.opp !== prev.opp && !greeted.has(met(now.opp))) {
+      greeted.add(met(now.opp));
+      // "ollu" is for someone arriving opposite me, not for the player I just sat down across from
+      if (prev.mine && prev.mine === now.mine) { const side = OTHER[v.mine]; say('ollu', () => ['ollu', glyph(side)]); }
+    }
+    if (now.oppRm && !prev.oppRm) { const side = OTHER[v.mine]; say('rematch', () => [glyph(side), icon('repeat')]); }
+  } else if (prev && !v.local && prev.table === now.table && v.g && v.mine) {
+    // a rematch began at the same table: the sides swapped
+    if (now.opp) greeted.add(met(now.opp));
+    requestAnimationFrame(() => flash(document.querySelector('#seats .seat.mine .bead')));
+  } else if (!v.local && v.g && now.opp) {
+    greeted.add(met(now.opp));
+  }
+  prev = now;
+}
+
+// ---- legend ----------------------------------------------------------------------------------------
+let legendOpener = null, legendPinned = false;
+function buildLegend() {
+  const lead = () => h('span', { class: 'lead' });
+  const row = (...kids) => h('div', { class: 'lg-row' }, kids);
+  const ring = (sk, cls) => h('span', { class: 'lg-ring' + (cls ? ' ' + cls : '') }, glyph(sk));
+  const panel = (sentence, ...rows) => h('div', { class: 'lg-panel' }, h('p', { class: 'sr-only', text: sentence }), rows);
+
+  // A: the rule, drawn on a strip of board
+  const strip = (n, diag) => {
+    const s = svgEl('svg', { viewBox: diag ? '0 0 64 34' : `0 0 ${n * 12 + 4} 16`, width: diag ? 64 : n * 12 + 4, height: diag ? 34 : 16, 'aria-hidden': 'true' });
+    const pts = Array.from({ length: n }, (_, i) => (diag ? [6 + i * 13, 28 - i * 5.5] : [8 + i * 12, 8]));
+    svgEl('line', { x1: pts[0][0], y1: pts[0][1], x2: pts[n - 1][0], y2: pts[n - 1][1], style: 'stroke: var(--butter); stroke-width: 1.5; stroke-linecap: round' }, s);
+    for (const [x, y] of pts) svgEl('circle', { cx: x, cy: y, r: 4, style: 'fill: var(--peach)' }, s);
+    return s;
+  };
+  const num = (sk, n) => h('span', { class: 'lg-num' }, glyph(sk), h('span', { text: String(n) }));
+  const A = panel('Five or more beads in a row, across, down or diagonally, wins. Peach moves first, then the two sides take turns.',
+    row(strip(5, true), lead(), icon('sparkle', 'butter')),
+    row(strip(6, false), lead(), icon('sparkle', 'butter')),
+    row(num('p', 1), num('l', 2), num('p', 3)));
+
+  // B: seats and people
+  const B = panel('A filled figure is you, a hollow one is someone else. Tap an open seat to sit. Dots mean waiting for someone. A door means that player left and the seat is open. The eye counts people watching.',
+    row(glyph('p'), icon('me', 'ink'), h('span', { class: 'lead' }), glyph('l'), icon('person')),
+    row(h('span', { class: 'lg-chip' }, icon('add')), icon('next'), glyph('l'), icon('me', 'ink')),
+    row(h('span', { class: 'ghosted' }, glyph('l')), icon('dots')),
+    row(h('span', { class: 'ghosted' }, glyph('l')), icon('leave')),
+    row(icon('eye'), h('span', { text: '2' }), lead(), icon('me', 'ink'), icon('person'), icon('person')));
+
+  // C: turns
+  const C = panel('A rose ring marks whose move it is. Dots beside it mean the other player is thinking. A dashed ring means the turn is paused because that player left.',
+    row(ring('p'), lead(), h('span', { class: 'ghosted' }, glyph('p'))),
+    row(ring('l'), icon('dots')),
+    row(ring('l', 'dashed')));
+
+  // D: endings
+  const D = panel('The flag resigns: press it, then press again to confirm. A butter ring and five beads mark the winner. Two bars mean a draw. When both players press the rematch arrows, a new game starts with the sides swapped.',
+    row(icon('flag'), icon('next'), h('span', { class: 'lg-pill' }, icon('flag'), icon('check', 'ink')), icon('next'), ring('p', 'butter'), icon('sparkle', 'butter')),
+    row(ring('p', 'butter'), icon('five', 'butter')),
+    row(glyph('p'), icon('even'), glyph('l')),
+    row(icon('repeat', 'ink'), icon('repeat', 'ink'), icon('next'), glyph('l'), icon('me', 'ink')));
+
+  // E: controls and connection
+  const E = panel(`The curved arrow undoes the last bead. The two arrows start a new game. The plus starts a table others can join.${host ? ' The link copies the invite link for a friend.' : ''} A filled dot means online, a dashed ring connecting, a moon offline.`,
+    row(icon('undo'), icon('next'), h('span', { class: 'ghosted' }, glyph('p'))),
+    row(icon('repeat'), icon('next'), h('span', { class: 'ghosted' }, glyph('p'), glyph('l'))),
+    row(icon('add'), icon('board'), icon('next'), h('span', { class: 'lg-dash' })),
+    host ? row(icon('link'), icon('next'), icon('person')) : null,
+    row(icon('done', 'mint'), icon('routine'), icon('rest')));
+
+  $('legend').replaceChildren(A, B, C, D, E);
+}
+function openLegend(pinned, opener) {
+  const el = $('legend');
+  if (el.hidden) buildLegend();
+  el.hidden = false;
+  legendPinned = pinned;
+  legendOpener = opener || null;
+  $('legend-scrim').hidden = !pinned;
+  $('legend-btn').setAttribute('aria-expanded', 'true');
+  if (pinned) { el.setAttribute('aria-modal', 'true'); el.focus(); } else el.removeAttribute('aria-modal');
+}
+function closeLegend() {
+  const el = $('legend');
+  if (el.hidden) return;
+  el.hidden = true;
+  el.removeAttribute('aria-modal');
+  $('legend-scrim').hidden = true;
+  $('legend-btn').setAttribute('aria-expanded', 'false');
+  if (legendOpener && legendOpener.isConnected) legendOpener.focus();
+  legendOpener = null;
+}
+function buildRuleStrip() {
+  const s = svgEl('svg', { viewBox: '0 0 150 16', width: 150, height: 16, 'aria-hidden': 'true' });
+  svgEl('line', { x1: 6, y1: 8, x2: 54, y2: 8, style: 'stroke: var(--butter); stroke-width: 1.5; stroke-linecap: round' }, s);
+  for (let i = 0; i < 5; i++) svgEl('circle', { cx: 6 + i * 12, cy: 8, r: 4, style: 'fill: var(--peach)' }, s);
+  const nest = (x, y, size, viewBox, color, fill) => { const n = svgEl('svg', { x, y, width: size, height: size, viewBox, style: `color:${color}` }, s); fill(n); return n; };
+  nest(62, 2, 12, '0 0 24 24', 'var(--butter)', (n) => { n.innerHTML = ICONS.sparkle; });
+  nest(92, 2, 12, '-0.5 -0.5 1 1', '', (n) => drawStone(n, 'p'));
+  nest(108, 2, 12, '0 0 24 24', 'var(--ink-dim)', (n) => { n.innerHTML = ICONS.next; });
+  nest(124, 2, 12, '-0.5 -0.5 1 1', '', (n) => drawStone(n, 'l'));
+  $('rule-strip').replaceChildren(s);
+  $('legend-btn').replaceChildren(icon('question'));
+}
+
+// ---- input -------------------------------------------------------------------------------------------
+function idxAt(ev) {
+  const m = svg.getScreenCTM();
+  if (!m) return -1;
+  const pt = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m.inverse());
+  const x = Math.round(pt.x) - 1, y = Math.round(pt.y) - 1;
+  if (x < 0 || y < 0 || x >= N || y >= N) return -1;
+  if (Math.hypot(pt.x - (x + 1), pt.y - (y + 1)) > 0.62) return -1;
+  return y * N + x;
+}
+function setHover(i) {
+  if (i === S.hover) return;
+  S.hover = i;
+  publish();
+  renderBoard();
+}
+let lastPointer = 'mouse';
+svg.addEventListener('pointerdown', (e) => { lastPointer = e.pointerType || 'mouse'; });
+svg.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') setHover(idxAt(e)); });
+svg.addEventListener('pointerleave', () => setHover(-1));
+svg.addEventListener('click', (e) => {
+  const i = idxAt(e);
+  if (i < 0) return;
+  S.kbd = false;
+  if (lastPointer === 'mouse') return play(i);
+  // touch and pen: the first tap shows the bead, a second tap on the same point places it
+  const v = view();
+  if (!v.canPlace || v.a.board[i]) return;
+  if (S.armed === i) return play(i);
+  S.armed = i;
+  publish();
+  renderBoard();
+});
+svg.addEventListener('keydown', (e) => {
+  let [x, y] = xy(S.cursor);
+  switch (e.key) {
+    case 'ArrowLeft': x = Math.max(0, x - 1); break;
+    case 'ArrowRight': x = Math.min(N - 1, x + 1); break;
+    case 'ArrowUp': y = Math.max(0, y - 1); break;
+    case 'ArrowDown': y = Math.min(N - 1, y + 1); break;
+    case 'Enter': case ' ': e.preventDefault(); return play(S.cursor);
+    default: return;
+  }
+  e.preventDefault();
+  S.cursor = y * N + x;
+  S.kbd = true;
+  const c = view().a.board[S.cursor];
+  announce(`${COLS[x]}${N - y}, ${c ? (c === 1 ? 'peach' : 'lilac') : 'empty'}`);
+  setHover(S.cursor);
+  renderBoard();
+});
+svg.addEventListener('focus', () => { S.kbd = svg.matches(':focus-visible'); renderBoard(); });
+svg.addEventListener('blur', () => { S.kbd = false; renderBoard(); });
+
+// A pending resign or leave is let go by a press anywhere else, Escape, or focus moving away.
+// On click, not pointerdown: by then the press has its target, so the other control's own click still lands.
+document.addEventListener('click', (e) => { if (S.confirm && !(e.target.closest && e.target.closest('.gbtn.armed'))) disarm(); }, true);
+// checked once focus has settled: a re-render replaces the armed button and puts focus back on its successor
+$('actions').addEventListener('focusout', () => {
+  if (!S.confirm) return;
+  setTimeout(() => {
+    const a = document.activeElement;
+    if (S.confirm && a && a !== document.body && !(a.closest && a.closest('.gbtn.armed'))) disarm();
+  }, 0);
+});
+$('legend-btn').addEventListener('click', (e) => { if ($('legend').hidden || !legendPinned) openLegend(true, e.currentTarget); else closeLegend(); });
+$('rule-strip').addEventListener('click', (e) => openLegend(true, e.currentTarget));
+// on click, so the scrim takes the whole tap and focus goes back to the opener after the browser's own focus step
+$('legend-scrim').addEventListener('click', closeLegend);
+const typing = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { if (!$('legend').hidden) closeLegend(); else disarm(); return; }
+  // the pinned legend is modal: it covers the controls, so Tab stays on it
+  if (e.key === 'Tab' && legendPinned && !$('legend').hidden) { e.preventDefault(); $('legend').focus(); return; }
+  if (e.key === '?' && !e.repeat && !typing(e.target) && $('legend').hidden) openLegend(false, document.activeElement);
+});
+document.addEventListener('keyup', (e) => {
+  if ((e.key === '?' || e.key === '/' || e.key === 'Shift') && !legendPinned) closeLegend();
+});
+
+// ---- the coil behind the board -------------------------------------------------------------------------
+function seeded(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function paintSky() {
+  const world = $('world'), c = $('sky'), wrap = $('wrap');
+  const ctx = c.getContext('2d');
+  if (!ctx) return;
+  const W = world.clientWidth, H = world.clientHeight;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  c.width = Math.round(W * dpr);
+  c.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const css = getComputedStyle(document.documentElement);
+  const T = (n) => css.getPropertyValue(n).trim();
+  const wr = wrap.getBoundingClientRect(), or = world.getBoundingClientRect();
+  const cx = wr.left - or.left + wr.width / 2, cy = wr.top - or.top + wr.height / 2;
+
+  const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.hypot(W, H) * 0.7);
+  bg.addColorStop(0, T('--dusk-glow'));
+  bg.addColorStop(0.45, T('--dusk-0'));
+  bg.addColorStop(1, T('--dusk-deep'));
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // one Archimedean coil of days, 28 beads a turn, starting just outside the board's corners
+  const TAU = Math.PI * 2, STEP = TAU / 28, P = 34;
+  const R0 = wr.width * 0.72 + 14;
+  const maxR = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy)) + 24;
+  const rnd = seeded(0x011e);
+  ctx.globalAlpha = 0.3;
+  ctx.strokeStyle = T('--line');
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let t = 0; ; t += STEP / 4) {
+    const r = R0 + (P * t) / TAU;
+    if (r > maxR) break;
+    const a = -Math.PI / 2 - t;
+    const x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+    if (t === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  const pal = { peach: T('--peach'), lilac: T('--lilac'), sky: T('--sky'), mint: T('--mint'), faint: T('--ink-faint') };
+  for (let k = 0; ; k++) {
+    const t = k * STEP, r = R0 + (P * t) / TAU;
+    if (r > maxR) break;
+    const a = -Math.PI / 2 - t;
+    const x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+    if (x < -20 || y < -20 || x > W + 20 || y > H + 20) { rnd(); rnd(); rnd(); continue; }
+    const fade = Math.max(0.35, 1 - (r - R0) / (maxR - R0 + 1) * 0.6);
+    const roll = rnd(), halo = rnd(), mk = rnd();
+    ctx.globalAlpha = 0.42 * fade;
+    ctx.beginPath();
+    if (roll < 0.45) { ctx.fillStyle = pal.faint; ctx.arc(x, y, 1.4, 0, TAU); }
+    else { ctx.fillStyle = pal.peach; ctx.arc(x, y, roll < 0.85 ? 2.4 : 3.3, 0, TAU); }
+    ctx.fill();
+    if (halo < 0.35 && roll >= 0.45) {
+      ctx.strokeStyle = pal.lilac;
+      ctx.lineWidth = 1.6;
+      const slots = 2 + Math.floor(halo * 18);
+      ctx.beginPath();
+      for (let s = 0; s < Math.min(8, slots); s++) {
+        const a0 = -Math.PI / 2 + (s * 45 + 4) * Math.PI / 180, a1 = a0 + 37 * Math.PI / 180;
+        ctx.moveTo(x + 6.4 * Math.cos(a0), y + 6.4 * Math.sin(a0));
+        ctx.arc(x, y, 6.4, a0, a1);
+      }
+      ctx.stroke();
+    }
+    if (mk < 0.22) {
+      const ux = Math.cos(a), uy = Math.sin(a);
+      ctx.beginPath();
+      ctx.fillStyle = mk < 0.12 ? pal.mint : pal.sky;
+      ctx.arc(x + ux * 10.5, y + uy * 10.5, 2, 0, TAU);
+      ctx.fill();
+    }
+  }
+  // a few faint stars
+  const stars = seeded(0x5eed);
+  for (let i = 0; i < 90; i++) {
+    const x = stars() * W, y = stars() * H, r = 0.45 + stars() * 0.75, a = 0.12 + stars() * 0.3, t = stars();
+    ctx.globalAlpha = a;
+    ctx.fillStyle = t < 0.1 ? T('--butter') : t < 0.2 ? T('--lilac') : T('--ink-dim');
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+let skyQueued = false;
+const queueSky = () => { if (skyQueued) return; skyQueued = true; requestAnimationFrame(() => { skyQueued = false; paintSky(); }); };
+
+// ---- boot --------------------------------------------------------------------------------------------
+async function connect(resume) {
+  const claude = window.claude;
+  if (!claude || typeof claude.use !== 'function') { S.room = null; return render(); }
+  const [room, user] = await Promise.all([
+    claude.use('room').catch(() => null),
+    claude.use('user').catch(() => null),
+  ]);
+  S.user = user;
+  if (!room) { S.room = null; return render(); }
+  S.room = room;
+  const dead = () => {
+    S.room = null;
+    S.connected = false;
+    if (S.mode === 'table') leaveTable(); else render();
+  };
+  let wasOn = null;
+  room.onConnection((on) => {
+    if (on && wasOn === false) announce('Online again.');
+    wasOn = on;
+    S.connected = on;
+    render();
+  }, dead);
+  let resumed = false;
+  room.onPeers((change) => {
+    S.peers = change.peers;
+    const me = change.peers.find((p) => p.sameTab);
+    if (me) { S.me.peer = me.peer; S.me.by = me.by; }
+    if (!resumed && S.me.peer) {
+      resumed = true;
+      if (resume && resume.code && /^[1-9]\d{3}$/.test(resume.code)) enterTable(resume.code, resume.seat === 'p' || resume.seat === 'l' ? resume.seat : null);
+    }
+    wantNames();
+    sync();
+  }, dead);
+  publish();
+  render();
+}
+
+function start(data) {
+  data = data || {};
+  const saved = Array.isArray(data.local) ? data.local : store.get('fivebeads.local');
+  if (Array.isArray(saved) && analyze(saved)) S.local = saved;
+  buildBoard();
+  buildRuleStrip();
+  render();
+  transitions();
+  paintSky();
+  if (window.ResizeObserver) new ResizeObserver(queueSky).observe($('world'));
+  window.addEventListener('resize', queueSky);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(queueSky);
+  if (!store.get('fivebeads.seen')) {
+    store.set('fivebeads.seen', 1);
+    setTimeout(() => say('hello', () => ['ollu']), 900);
+  }
+  connect(data.code ? data : store.get('fivebeads.table', 'sessionStorage'));
+}
+
+if (/[?&]debug\b/.test(location.search)) window.__fiveBeads = { S, view, canonFor };
+const hot = window.claude && window.claude.hot;
+try { if (hot && typeof hot.snapshot === 'function') hot.snapshot(() => ({ local: S.local, code: S.code, seat: myColor(S.g) })); } catch {}
+if (hot && typeof hot.ready === 'function') hot.ready(start); else start((hot && hot.data) || {});
+})();
+</script>
+</body>
+</html>
